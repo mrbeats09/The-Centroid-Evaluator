@@ -1,7 +1,11 @@
 .venv
-__pycache__ 
+__pycache__
 failed_targets.log
 sparse_targets.log
-tpf_temp 
-tess_training_data.csv 
-.DS_Store 
+tpf_temp
+tess_training_data.csv
+kepler_training_data_*.csv
+cache/
+.DS_Store
+.claude
+CLAUDE.md

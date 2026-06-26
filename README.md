@@ -1,14 +1,29 @@
 # Yet-Another-Exoplanet-Classifier
 
-A convolutional neural network ablation study investigating whether centroid motion time series from TESS photometry improves automated classification of exoplanet transit candidates versus eclipsing binary false positives.
+A study of how progressively degraded spatial sampling reduces the information content of
+centroid measurements for automated exoplanet vetting, using a dual-branch 1D CNN and a
+simplified Bryson (2013)-style difference-image baseline evaluated on Kepler KOI data.
 
 ---
 
-## Overview
+## Scientific Objective
 
-This repository implements a three-model ablation study using phase-folded TESS light curves to classify TOI (TESS Object of Interest) candidates as either planet candidates or false positives (eclipsing binaries). The central question is whether adding centroid motion channels — MOM_CENTR1 and MOM_CENTR2 from the TESS SPOC pipeline — alongside flux improves classification performance over flux alone.
+This repository answers a single question:
 
-All three models share an identical dual-branch 1D CNN architecture and training configuration, differing only in their input channels. 
+> **How does progressively degraded spatial sampling (effective astrometric resolution)
+> reduce the information content of centroid measurements for automated exoplanet vetting?**
+
+The degradation engine is an intentional experimental control: the photometric light curve
+is held at native Kepler quality while the centroid pixel scale is systematically coarsened
+by integer factors k = [1, 2, 3, 4, 5] (effective scales 3.98″ → 19.9″ arcsec/pixel).
+This isolates centroid information content as the independent variable. This is **not** a
+simulation of TESS or any other telescope — k is a scan through a control parameter.
+
+The expected chain of reasoning is:
+
+```
+Spatial sampling (k)  →  Centroid measurement quality  →  Classification performance (AUC)
+```
 
 ---
 
@@ -16,76 +31,156 @@ All three models share an identical dual-branch 1D CNN architecture and training
 
 ### Step 1 — Build the target manifest
 ```bash
-python getExamples.py
+python getExamples.py [--fp-subset {all,centroid_offset}]
 ```
-Queries the TESS TOI catalogue via ExoFOP and produces `classified_targets.csv` with stratified positive (planet candidate) and negative (false positive / eclipsing binary) labels.
+Queries the NASA Exoplanet Archive KOI cumulative table via TAP/ADQL and writes
+`koi_manifest.csv`. Default (`--fp-subset all`): positives = CONFIRMED, negatives = all
+FALSE POSITIVE subtypes. Pass `--fp-subset centroid_offset` to restrict negatives to
+centroid-offset FPs only (`koi_fpflag_co=1`).
 
-### Step 2 — Download and process light curves
+### Step 2 — Download TPFs and build cache
 ```bash
-python getInputData.py
+python getInputData.py [--max-quarters N]
 ```
-Runs a three-phase async pipeline:
-- **Phase 1:** Queries MAST via `lightkurve` to find available SPOC FITS files for each target
-- **Phase 2:** Downloads FITS files concurrently via `aiohttp` (15-connection semaphore)
-- **Phase 3:** Processes each target — quality masking, sigma-clipping, phase folding, OOT normalisation, median binning to 1,000 phase bins — and writes `tess_training_data.csv`
+Downloads Kepler long-cadence Target Pixel Files (TPFs) for each KIC target, then runs the
+degradation engine to produce cached intermediate files. `--max-quarters N` caps how many
+quarters are used per target (no cap if omitted). Resumable: existing cache files are
+skipped. Outputs:
+- `tpf_temp/` — raw FITS cache (lightkurve managed)
+- `cache/flux/{kepid}.npz` — native-resolution phase-folded flux (shared across all k)
+- `cache/centroids/{kepid}_k{K}_psf{0|1}.npz` — centroid time series per (k, PSF setting)
 
-Each row in the output CSV contains 3,006 columns: 6 metadata fields followed by 1,000 flux bins (`f_0`…`f_999`), 1,000 RA centroid bins (`m1_0`…`m1_999`), and 1,000 Dec centroid bins (`m2_0`…`m2_999`).
-
-### Step 3 — Train the models
-Run each model script independently:
+### Step 3 — Write training CSVs
 ```bash
-python theModel_fluxOnly.py        # Model A — flux data only 
-python theModel.py                 # Model B — flux + centroid data 
-python theModel_centroidOnly.py    # Model C — centroid data only 
+python getInputData.py --phase csv-only
 ```
+Reads from `cache/` (no FITS access) and writes one CSV per (k, PSF setting):
+`kepler_training_data_k{K}_psf{0|1}.csv`. Flux columns are byte-identical across k; only
+centroid columns (m1, m2) differ.
 
-Each script performs 5-fold stratified cross-validation with per-fold threshold optimisation, followed by 5-fold ensemble prediction. Results are saved to their respective `results_*/` directory as a confusion matrix PNG and a metrics report text file.
-
-### Step 4 — Run the Wilcoxon test
+### Step 4 — Centroid quality analysis
 ```bash
-python wilcoxon_test.py
+python centroid_quality.py
 ```
-Reads per-fold AUC values from each model's metrics report and runs paired Wilcoxon signed-rank tests comparing Model A vs B and Model A vs C. Prints and saves results to `results/wilcoxon_results.txt`.
+Aggregates centroid RMS, uncertainty, SNR, and offset across targets per (k, PSF setting).
+Writes `results_resolution/centroid_quality.csv` and `figures/fig2_centroid_quality.png`.
+
+### Step 5 — Train CNN per degradation level
+```bash
+python theModel.py
+```
+Trains the dual-branch 1D CNN with KIC-grouped 5-fold CV plus a held-out test set for each
+`kepler_training_data_k{K}_psf{*}.csv`. Saves per-target scores to
+`results_resolution/scores_k{K}_psf{P}.csv`.
+
+### Step 6 — Compute statistics
+```bash
+python stats_ml.py [--enable-delong]
+```
+Bootstrap 95% CIs on ROC-AUC and PR-AUC (resampling targets, 2000 iterations). Computes
+breakdown resolution k_break_90 and k_break_snr. DeLong pairwise testing is optional
+(disabled by default).
+
+### Step 7 — Bryson baseline
+```bash
+python baselines.py [--enable-vetting]
+```
+Reads pre-computed difference-image offsets from `cache/centroids/` and computes ROC-AUC
++ bootstrap CIs per k. Optionally runs the `vetting` package (Hedges 2021) if
+`--enable-vetting` is passed; failures are logged and never terminate the run.
+
+### Step 8 — Assemble outputs
+```bash
+python compare.py
+```
+Writes `results_resolution/comparison.csv`, `results_resolution/report.md`, and figures.
 
 ---
 
 ## Model Architecture
 
-A dual-branch shallow 1D CNN implemented in TensorFlow/Keras:
+A dual-branch 1D CNN (preserved from prior work, architecture untouched):
 
-- **Global branch** — receives the full input sequence (1,000 bins, all channels). Three Conv1D blocks (32→64→128 filters, kernel size 5) with BatchNorm, ReLU, and MaxPooling, followed by GlobalAveragePooling → 128-dim vector.
-- **Local branch** — receives only the central 200 bins of the flux channel (the transit window). Two Conv1D blocks (32→64 filters) followed by GlobalAveragePooling → 64-dim vector.
-- **Classification head** — Concatenate(128+64) → Dense(128) → Dropout(0.5) → Dense(32) → Dropout(0.5) → Dense(1, sigmoid)
+- **Global branch** — full 1,000-bin sequence, all 3 channels (flux, RA centroid, Dec
+  centroid). Three Conv1D blocks (32→64→128 filters, kernel 5) + BatchNorm + MaxPooling →
+  GlobalAveragePooling → 128-dim vector.
+- **Local branch** — central 200 bins of the flux channel only (bins 400–600, the transit
+  window). Two Conv1D blocks (32→64 filters) + GlobalAveragePooling → 64-dim vector.
+- **Head** — Concatenate(192) → Dense(128) → Dropout(0.5) → Dense(32) → Dropout(0.5) →
+  Dense(1, sigmoid).
 
-Training uses focal loss (γ=2.0, label smoothing=0.1), Adam optimiser, linear LR warmup, ReduceLROnPlateau, EarlyStopping, class weights {FP: 2.0, Planet: 1.0}, and three physically motivated augmentations (phase jitter, Gaussian noise, flux scaling).
-
----
-
-## Results
-
-| Model | Input | CV AUC-ROC |
-|---|---|---|
-| A — Flux Only | (N, 1000, 1) | 0.7268 ± 0.0216 |
-| B — Flux + Centroid | (N, 1000, 3) | 0.7287 ± 0.0216 |
-| C — Centroid Only | (N, 1000, 2) | 0.6151 ± 0.0274 |
-
-Wilcoxon test (A vs B): W=6.0, p=0.8125 | Adding centroid channels produces no meaningful improvement over flux alone.
-
-Wilcoxon test (A vs C): W=0.0, p=0.0625 | Which is narrowly below the power ceiling of the test at n=5 (minimum achievable p=0.0625). Model A outperformed Model C in all five folds.
+Training: focal loss (γ=2.0, label smoothing=0.1), Adam 1e-3, linear LR warmup (epochs
+0–4), ReduceLROnPlateau on val AUC, EarlyStopping (patience=15), class weights
+{FP: 2.0, Planet: 1.0}, phase jitter + Gaussian noise + flux scaling augmentations.
 
 ---
 
-## Requirements
+## Data
 
-Install with:
-```bash
-pip install tensorflow scikit-learn numpy pandas scipy lightkurve aiohttp astropy tqdm matplotlib
+- **Source:** NASA Exoplanet Archive KOI cumulative table; Kepler long-cadence TPFs via MAST
+- **Positives (label 1):** `koi_disposition = CONFIRMED`
+- **Negatives (label 0):** `koi_disposition = FALSE POSITIVE` (all subtypes, Option A default)
+- **Epoch convention:** `koi_time0bk` is already in BKJD (BJD − 2,454,833). Used directly.
+  Do NOT subtract 2,457,000 (that is the TESS BTJD offset).
+- **Group identity:** `kepid` — all KOIs from one KIC star stay in one CV fold and on one
+  side of the train/test split.
+
+---
+
+## Training CSV schema
+
+`kepler_training_data_k{K}_psf{0|1}.csv` — 3,009 columns per row:
+- 7 metadata fields: `kepid, kepoi_name, label, fp_subtype, koi_period, koi_time0bk, koi_duration`
+- `f_0`…`f_999` — native-res flux, OOT-normalised, standardised (clipped ±10 before training)
+- `m1_0`…`m1_999` — RA flux-weighted moment centroid at scale k, OOT-subtracted and standardised
+- `m2_0`…`m2_999` — Dec centroid, same normalisation
+
+Flux columns are identical across all k; only m1/m2 change with k and PSF setting.
+
+---
+
+## Cache hierarchy
+
+```
+tpf_temp/                          ← raw FITS (lightkurve cache; gitignored)
+cache/
+    flux/{kepid}.npz               ← native-res folded flux (computed once)
+    centroids/{kepid}_k{K}_psf{P}.npz   ← centroid series + quality metrics per (k, PSF)
+    cubes/{kepid}_q{Q}_k{K}_psf{P}.npz  ← degraded pixel cubes (intermediate)
+results_resolution/
+    centroid_quality.csv
+    centroid_scaling.csv
+    breakdown.csv
+    comparison.csv
+    report.md
+    scores_k{K}_psf{P}.csv
+    metrics_k{K}_psf{P}.txt
+    figures/
+        fig1_auc_vs_k.png
+        fig2_centroid_quality.png
+        fig3_difference_images.png
 ```
 
 ---
 
-## Dataset
+## Install
 
-- **Source:** TESS TOI catalogue via ExoFOP, light curves from MAST SPOC pipeline
-- **Size:** 2,023 examples — 962 false positives (label 0), 1,061 planet candidates (label 1)
-- **Input shape:** (N, 1000, 3) — phase-folded, OOT-normalised, median-binned
+```bash
+pip install lightkurve tensorflow scikit-learn numpy pandas scipy astropy tqdm matplotlib
+# optional (only for --enable-vetting):
+pip install vetting
+```
+
+---
+
+## Key constraints
+
+- **BKJD epoch** — `koi_time0bk` is used directly; never subtract 2,457,000.
+- **No target leakage** — `kepid` groups are never split across CV folds or train/test boundary.
+- **k=1 validation gate** — the degradation engine asserts that native-resolution
+  difference-image centroid uncertainty is < 1.0″ on ≥80% of targets before proceeding.
+- **CNN architecture is preserved** — `theModel.py` changes only the CV grouping, the
+  held-out test split, and the outer per-k loop. All layers, loss, and training config
+  are untouched.
+- **vetting is optional** — `baselines.py --enable-vetting`; defaults OFF. All vetting
+  failures are caught and logged; they never terminate the pipeline.
