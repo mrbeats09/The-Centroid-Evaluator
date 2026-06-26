@@ -1,22 +1,22 @@
 # The Centroid Evaluator
 
-How much does spatial resolution actually matter for catching fake exoplanets?
+To what extent does spatial resolution make a difference when using centroid movement to vet out exoplanets? 
 
-This project answers that by taking real Kepler data and systematically coarsening the pixel scale of the centroid measurements while holding everything else constant. At native resolution a centroid shift can tell you whether a transit is coming from the target star or a nearby background eclipsing binary. As the pixels get coarser that signal degrades. This project measures exactly how fast it degrades and at what point it stops being useful.
+This project answers exactly this by taking real Kepler data and systematically coarsening the pixel scale of the centroid measurements while holding everything else constant. At native resolution a centroid shift can tell you whether a transit is coming from the target star or a nearby background eclipsing binary. As the pixels get coarser that signal degrades. This project measures exactly how fast it degrades and at what point it stops being useful for vetting exoplanets.
 
-The result is a degradation curve: ROC-AUC vs. effective pixel scale, produced by a neural network classifier and a simpler Bryson-style baseline, with bootstrap confidence intervals at each level.
+The result is a degradation curve: ROC-AUC vs. effective pixel scale, produced by a 1-dimensional convolutional neural network classifier as well as a simpler Bryson-style baseline [(Bryson et al.)](http://arxiv.org/abs/1303.0052), with bootstrap confidence intervals at each level.
 
 ---
 
-## How it works
+## How it works (Independent Variable) 
 
-The core idea is straightforward. Kepler's native pixel scale is 3.98 arcseconds per pixel. We apply a rebinning factor `k` from 1 to 5, which gives effective scales ranging from 3.98 to 19.9 arcsec/pixel. The flux light curve is kept at native resolution throughout. Only the centroid channels are degraded. This isolates spatial sampling as the independent variable.
+As you may know, Kepler's native pixel scale is 3.98 arcseconds per pixel. We apply a rebinning factor `k` from 1 to 5, which gives effective scales ranging from 3.98 to 19.9 arcsec/pixel. The flux light curve is kept at native resolution throughout. Only the centroid channels are degraded. This isolates spatial sampling as the independent variable.
 
 ```
 Pixel scale (k)  →  Centroid quality  →  Classification performance
 ```
 
-This is not a simulation of TESS or any other telescope. The k values are a controlled experimental scan, nothing more.
+This is not a simulation of TESS or any other telescope, given that flux remains as-is. However, future work could potentially simulate a reduced flux imaging resolution for greater accuracy. It would allow for existing projects such as PLATO or RST to be directly compared in order to view the efficacy of centroid motion on their observations, or even influence future projects when deciding on an ideal pixel scale for observation. 
 
 ---
 
@@ -131,12 +131,12 @@ pip install -r requirements.txt
 
 ## A few things worth knowing
 
-**Data source.** Positives are KOIs with `koi_disposition = CONFIRMED`. Negatives are all `FALSE POSITIVE` subtypes (the default). You can restrict to centroid-offset false positives only with `--fp-subset centroid_offset`.
+**Data source:** Positives are KOIs with `koi_disposition = CONFIRMED`, ignoring the candidate ones. Negatives are all `FALSE POSITIVE` subtypes (the default). You can restrict to centroid-offset false positives only with `--fp-subset centroid_offset`.
 
-**No leakage.** All KOIs from the same KIC star are always on the same side of any train/test split. Cross-validation folds are grouped by `kepid`.
+**No leakage:** All KOIs from the same KIC star are always on the same side of any train/test split. Cross-validation folds are grouped by `kepid`.
 
-**Caching.** The two expensive operations (downloading TPFs and building the degraded cache) each write their outputs to disk and skip targets that are already done. Reruns are cheap.
+**Caching:** The two most 'expensive' operations (downloading TPFs + building the degraded cache) each write their outputs to disk and skip targets that are already done. Re-running after an interruption isn't a hassle. 
 
-**PSF broadening.** Each k level is processed twice: once with rebinning only and once with an additional Gaussian blur to simulate PSF growth. The comparison between these two settings is a robustness check rather than a physical claim.
+**PSF broadening:** Each k level is processed twice, once with rebinning only and once with an additional Gaussian blur to simulate PSF growth. The comparison between these two settings is a robustness check rather than a physical claim.
 
-**Vetting and DeLong are off by default.** The pipeline produces complete publishable results without either. They are opt-in extras.
+**Vetting and DeLong are off by default:** Added in for extra comparison points between the ML and statistical results, they are not present in the main evaluation which utilises the pipeline established by Bryson et al. (2013). 
