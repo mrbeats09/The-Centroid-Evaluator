@@ -1,37 +1,41 @@
 """
-theModel.py — Dual-Branch 1D CNN for TESS Exoplanet vs False Positive Classification
+theModel.py — Dual-Branch 1D CNN for Kepler Exoplanet Centroid Degradation Study
 
 Architecture: Two parallel convolutional branches whose outputs are concatenated
 before a regularised classification head.
-  - Global branch: all 3 channels (flux, centr1, centr2) × 1000 phase bins.
-    Learns coarse features: secondary eclipses, OOT variability, centroid trends.
-  - Local branch: flux channel only, central 200 bins (transit window).
+  - Global branch: all 3 channels (flux=ch0, RA centroid=ch1, Dec centroid=ch2)
+    × 1000 phase bins. Learns coarse features: centroid trends, OOT variability.
+  - Local branch: flux channel only (ch0), central 200 bins (transit window).
     Learns fine transit morphology: flat-bottom vs V-shape, ingress sharpness.
 
-Key training decisions for a small (~2,000 example) dataset:
-  - model.fit() with Keras callbacks — avoids the instability of manual loops
-  - Focal loss with label smoothing — focuses learning on hard examples,
-    prevents overconfidence on easy examples
-  - Class weighting {FP: 2.0, Planet: 1.0} — penalises EB misclassification more
-  - Batch Normalisation after each Conv1D — stabilises training for small data
-  - Learning rate warm-up — lets Adam accumulate gradient statistics before
-    making large parameter updates
-  - Per-fold threshold optimisation — finds the sigmoid cut-point that maximises
-    F1-macro on each validation fold, not fixed at 0.5
-  - Augmentation via Keras Sequence — applied only during training
-  - Stratified 5-fold CV — preserves class ratio
-  - 5-fold ensemble — averages predictions across all fold models
+Architecture and training configuration are FROZEN. Do not modify them.
+The channel layout (flux=0, m1=1, m2=2) is preserved; the local branch slices
+channel 0 exactly as before.
 
-Outputs:
-  - results/confusion_matrix.png  — clean Purples confusion matrix
-  - results/metrics_report.txt    — per-fold, CV-averaged, and ensemble metrics
+Changes from the prior TESS version:
+  - CV uses StratifiedGroupKFold keyed on kepid (no KIC target leakage)
+  - 20% held-out test set, split at kepid level before any CV
+  - Outer loop over per-k training CSVs (kepler_training_data_k{K}_psf{P}.csv)
+  - Per-k test scores saved to results_resolution/scores_k{K}_psf{P}.csv
+  - OUTPUT_DIR → results_resolution/
+
+All other code (focal loss, optimiser, LR schedule, augmentations, architecture)
+is untouched from the working TESS version.
+
+Outputs (per k, psf):
+  - results_resolution/scores_k{K}_psf{P}.csv  — per-target test-set scores
+  - results_resolution/metrics_k{K}_psf{P}.txt — per-fold + ensemble metrics
+  - results_resolution/confusion_matrix_k{K}_psf{P}.png
 """
 
+import argparse
+import glob
 import os
+import warnings
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import warnings
 
 warnings.filterwarnings("ignore")
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -42,18 +46,17 @@ from tensorflow.keras import layers, regularizers
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, LearningRateScheduler
 from tensorflow.keras.utils import Sequence
 
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedShuffleSplit
 from sklearn.metrics import (
     accuracy_score, f1_score, precision_score, recall_score,
     roc_auc_score, confusion_matrix
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION
+# CONFIGURATION — architecture/training constants frozen; do not change
 # ─────────────────────────────────────────────────────────────────────────────
 
-DATA_PATH    = "tess_training_data.csv"
-OUTPUT_DIR   = "results"
+OUTPUT_DIR   = "results_resolution"
 NUM_BINS     = 1000
 LOCAL_START  = 400   # Central 200 bins capture the transit window (phase ≈ ±0.1)
 LOCAL_END    = 600
@@ -61,10 +64,10 @@ N_FOLDS      = 5
 EPOCHS       = 120
 BATCH_SIZE   = 32
 RANDOM_SEED  = 42
+TEST_FRAC    = 0.20   # 20% of unique kepids held out as test set
 
-# Class weights: down-weight the planet class so EB misclassifications
+# Class weights: down-weight the planet class so FP misclassifications
 # contribute proportionally more to the loss and gradient updates.
-# This directly counteracts the model's natural bias toward the easier class.
 CLASS_WEIGHT = {0: 2.0, 1: 1.0}
 
 np.random.seed(RANDOM_SEED)
@@ -78,23 +81,23 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def load_and_preprocess(csv_path):
     """
-    Load the CSV and reshape the flat columns into a (N, 1000, 3) tensor.
-    TensorFlow's Conv1D expects channels-last format: (batch, length, channels).
+    Load the per-k training CSV and reshape flat columns into a (N, 1000, 3) tensor.
+    TensorFlow's Conv1D expects channels-last: (batch, length, channels).
 
-    Final pre-processing applied here:
-      - Flux clipped to [-10, 10]: very quiet stars produce tiny OOT standard
-        deviations, making their standardised transit depths reach -50 or worse.
-        Clipping preserves all physically meaningful transit depths while
-        preventing a handful of extreme examples from dominating the gradients.
-      - NaN replacement with 0: zero is the correct default since both channels
-        are zero-centred after processing in getInputData.py.
+    Channel layout (FROZEN — do not change):
+      channel 0 = flux  (clipped ±10; local branch slices this channel)
+      channel 1 = m1    (RA flux-weighted moment centroid at scale k)
+      channel 2 = m2    (Dec centroid)
+
+    Also returns kepid_arr and fp_subtype_arr for grouping and subgroup analysis.
     """
-    print("Loading dataset...")
+    print(f"Loading dataset: {csv_path}")
     df = pd.read_csv(csv_path)
     n  = len(df)
     print(f"  {n} examples  |  "
           f"Label 0 (FP): {(df['label']==0).sum()}  |  "
-          f"Label 1 (Planet): {(df['label']==1).sum()}")
+          f"Label 1 (Planet): {(df['label']==1).sum()}  |  "
+          f"{df['kepid'].nunique()} unique KIC targets")
 
     flux   = df[[f"f_{i}"  for i in range(NUM_BINS)]].values.astype(np.float32)
     centr1 = df[[f"m1_{i}" for i in range(NUM_BINS)]].values.astype(np.float32)
@@ -102,13 +105,16 @@ def load_and_preprocess(csv_path):
 
     flux = np.clip(flux, -10.0, 10.0)
 
-    # Stack to (N, 1000, 3) — channels last, as TF Conv1D expects
+    # Stack to (N, 1000, 3) — channels last; ch0=flux, ch1=m1, ch2=m2
     X = np.stack([flux, centr1, centr2], axis=2)
     X = np.nan_to_num(X, nan=0.0)
 
-    y = df["label"].values.astype(np.int32)
+    y           = df["label"].values.astype(np.int32)
+    kepid_arr   = df["kepid"].values
+    fp_subtype  = df.get("fp_subtype", pd.Series([""] * n)).values
+
     print(f"  Tensor shape: {X.shape}  dtype: {X.dtype}")
-    return X, y, n
+    return X, y, kepid_arr, fp_subtype, n
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -480,13 +486,21 @@ def save_confusion_matrix(cm_avg, output_path):
     print(f"  Confusion matrix → {output_path}")
 
 
-def save_metrics_report(fold_metrics, ensemble_metrics, n_total, output_path):
+def save_scores(kepid_arr, kepoi_arr, fp_subtype_arr, y_true, y_score, out_path):
+    """Save per-target held-out test scores to CSV for downstream analysis."""
+    pd.DataFrame({
+        "kepid":      kepid_arr,
+        "kepoi_name": kepoi_arr,
+        "label":      y_true,
+        "fp_subtype": fp_subtype_arr,
+        "score":      y_score,
+    }).to_csv(out_path, index=False)
+    print(f"  Test scores → {out_path}")
+
+
+def save_metrics_report(fold_metrics, ensemble_metrics, n_total, output_path, tag=""):
     """
-    Write a structured text report with per-fold, CV-averaged, and ensemble metrics.
-    The ensemble metrics are computed by averaging sigmoid probabilities from
-    all five fold models and finding the optimal threshold on the full dataset.
-    Note: This is an optimistic estimate since each fold model has seen 80% of
-    the data during training, but it demonstrates ensemble calibration.
+    Write a structured text report with per-fold, CV-averaged, and test-set metrics.
     """
     metric_keys = [
         "threshold", "accuracy", "f1_planet", "f1_fp", "f1_macro",
@@ -496,11 +510,11 @@ def save_metrics_report(fold_metrics, ensemble_metrics, n_total, output_path):
     sep = "=" * 67
     lines = [
         sep,
-        "TESS EXOPLANET vs FALSE POSITIVE — CLASSIFICATION RESULTS",
+        f"KEPLER CENTROID RESOLUTION DEGRADATION STUDY — CNN RESULTS {tag}",
         f"Architecture  : Dual-Branch 1D CNN (channels-last)",
-        f"Dataset       : {n_total} examples  |  {N_FOLDS}-fold stratified CV",
+        f"Dataset       : {n_total} examples  |  {N_FOLDS}-fold KIC-grouped CV",
         f"Class weights : FP × {CLASS_WEIGHT[0]}  |  Planet × {CLASS_WEIGHT[1]}",
-        f"Classes       : 0 = False Positive (EB/NEB/FP)  |  1 = Planet (CP/KP/PC)",
+        f"Classes       : 0 = False Positive  |  1 = Confirmed Planet",
         sep, "",
         "PER-FOLD RESULTS", "-" * 67,
         f"{'Metric':<22}" + "".join(f"  Fold {k+1}" for k in range(N_FOLDS)),
@@ -572,31 +586,68 @@ def save_metrics_report(fold_metrics, ensemble_metrics, n_total, output_path):
 # SECTION 9 — MAIN PIPELINE
 # ═════════════════════════════════════════════════════════════════════════════
 
-def main():
-    print("\n" + "=" * 67)
-    print("  TESS Dual-Branch CNN — Training Pipeline")
-    print("=" * 67)
+def _train_and_eval_one_csv(csv_path: str) -> None:
+    """Train the CNN for one per-k training CSV and save scores + metrics."""
+    # Parse k and psf from filename, e.g. kepler_training_data_k3_psf1.csv
+    basename = os.path.basename(csv_path)
+    tag = basename.replace("kepler_training_data_", "").replace(".csv", "")
 
-    X, y, n_total = load_and_preprocess(DATA_PATH)
+    X, y, kepid_arr, fp_subtype_arr, n_total = load_and_preprocess(csv_path)
 
-    print("\nModel summary:")
-    build_model().summary(line_length=67)
+    # ── Held-out test set: 20% of unique kepids, stratified by label ──────────
+    unique_kepids = np.unique(kepid_arr)
+    # Build per-kepid label (majority vote to handle multi-KOI kepids)
+    kepid_label = {}
+    for kp in unique_kepids:
+        mask = kepid_arr == kp
+        kepid_label[kp] = int(np.bincount(y[mask]).argmax())
+    kepid_labels_arr = np.array([kepid_label[kp] for kp in unique_kepids])
 
-    skf          = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=TEST_FRAC, random_state=RANDOM_SEED)
+    cv_kepids_idx, test_kepids_idx = next(sss.split(unique_kepids, kepid_labels_arr))
+    cv_kepids  = set(unique_kepids[cv_kepids_idx])
+    test_kepids = set(unique_kepids[test_kepids_idx])
+
+    # Assert no leakage — a kepid must not appear on both sides
+    assert cv_kepids.isdisjoint(test_kepids), \
+        f"kepid leakage: {cv_kepids & test_kepids}"
+
+    cv_mask   = np.array([kp in cv_kepids   for kp in kepid_arr])
+    test_mask = np.array([kp in test_kepids for kp in kepid_arr])
+
+    X_cv,   y_cv,   groups_cv   = X[cv_mask],   y[cv_mask],   kepid_arr[cv_mask]
+    X_test, y_test, kepid_test  = X[test_mask],  y[test_mask],  kepid_arr[test_mask]
+    fp_subtype_test = fp_subtype_arr[test_mask]
+
+    print(f"\nCV set:   {cv_mask.sum()} examples, {len(cv_kepids)} unique KIC")
+    print(f"Test set: {test_mask.sum()} examples, {len(test_kepids)} unique KIC")
+
+    # ── KIC-grouped 5-fold CV ─────────────────────────────────────────────────
+    sgkf = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_SEED)
     fold_metrics = []
     fold_models  = []
     all_cms      = []
 
-    print(f"\nBeginning {N_FOLDS}-fold stratified cross-validation...")
+    print(f"\nBeginning {N_FOLDS}-fold KIC-grouped CV  [{tag}]")
     print(f"Class weights: {CLASS_WEIGHT}")
     print("-" * 67)
 
-    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X, y)):
-        print(f"\nFold {fold_idx + 1}/{N_FOLDS}  "
-              f"(train: {len(train_idx)}  val: {len(val_idx)})")
+    for fold_idx, (train_idx, val_idx) in enumerate(
+        sgkf.split(X_cv, y_cv, groups=groups_cv)
+    ):
+        # Runtime leakage check: no kepid in both train and val
+        train_kepids = set(groups_cv[train_idx])
+        val_kepids   = set(groups_cv[val_idx])
+        assert train_kepids.isdisjoint(val_kepids), \
+            f"Fold {fold_idx+1}: kepid leakage into validation set"
 
-        model   = train_fold(X[train_idx], y[train_idx], X[val_idx], y[val_idx])
-        metrics = evaluate_fold(model, X[val_idx], y[val_idx])
+        print(f"\nFold {fold_idx + 1}/{N_FOLDS}  "
+              f"(train: {len(train_idx)}  val: {len(val_idx)}  "
+              f"val_kic: {len(val_kepids)})")
+
+        model   = train_fold(X_cv[train_idx], y_cv[train_idx],
+                             X_cv[val_idx],   y_cv[val_idx])
+        metrics = evaluate_fold(model, X_cv[val_idx], y_cv[val_idx])
         fold_metrics.append(metrics)
         fold_models.append(model)
         all_cms.append(metrics["confusion_matrix"])
@@ -604,76 +655,99 @@ def main():
         print(f"    Accuracy: {metrics['accuracy']:.4f}  |  "
               f"AUC-ROC: {metrics['roc_auc']:.4f}  |  "
               f"F1-macro: {metrics['f1_macro']:.4f}")
-        print(f"    EB recall: {metrics['recall_fp']:.4f}  |  "
-              f"Planet recall: {metrics['recall_planet']:.4f}")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Ensemble prediction: average sigmoid probabilities from all 5 fold models
-    # ─────────────────────────────────────────────────────────────────────────
-    print("\nComputing 5-fold ensemble predictions...")
-    ensemble_probs = np.zeros(len(X))
-
-    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X, y)):
-        model = fold_models[fold_idx]
-        y_prob_fold = model.predict(split_inputs(X), verbose=0, batch_size=64).flatten()
-        ensemble_probs += y_prob_fold
-
-        # Free GPU memory after prediction
-        del model
+    # ── Ensemble inference on held-out test set ───────────────────────────────
+    print(f"\nComputing ensemble scores on held-out test set ({len(X_test)} examples)...")
+    test_probs = np.zeros(len(X_test))
+    for fold_model in fold_models:
+        test_probs += fold_model.predict(
+            split_inputs(X_test), verbose=0, batch_size=64
+        ).flatten()
         tf.keras.backend.clear_session()
+    test_probs /= N_FOLDS
 
-    ensemble_probs /= N_FOLDS
+    # Read kepoi_name from CSV for the test-set rows
+    df_full = pd.read_csv(csv_path, usecols=["kepid", "kepoi_name"])
+    kepoi_map = df_full.set_index("kepid")["kepoi_name"].to_dict()
+    kepoi_test = np.array([str(kepoi_map.get(kp, "")) for kp in kepid_test])
 
-    # Find optimal threshold on full dataset and compute ensemble metrics
-    ensemble_thresh, _ = find_best_threshold(y, ensemble_probs)
-    ensemble_pred = (ensemble_probs >= ensemble_thresh).astype(int)
+    # Save raw per-target scores for downstream baselines + stats_ml.py
+    scores_path = os.path.join(OUTPUT_DIR, f"scores_{tag}.csv")
+    save_scores(kepid_test, kepoi_test, fp_subtype_test, y_test, test_probs, scores_path)
+
+    # Ensemble metrics on test set (threshold optimised on test set — informational only)
+    test_thresh, _ = find_best_threshold(y_test, test_probs)
+    test_pred = (test_probs >= test_thresh).astype(int)
 
     ensemble_metrics = {
-        "threshold":        ensemble_thresh,
-        "accuracy":         accuracy_score(y, ensemble_pred),
-        "f1_planet":        f1_score(y, ensemble_pred, pos_label=1, zero_division=0),
-        "f1_fp":            f1_score(y, ensemble_pred, pos_label=0, zero_division=0),
-        "f1_macro":         f1_score(y, ensemble_pred, average="macro", zero_division=0),
-        "f1_weighted":      f1_score(y, ensemble_pred, average="weighted", zero_division=0),
-        "precision_planet": precision_score(y, ensemble_pred, pos_label=1, zero_division=0),
-        "precision_fp":     precision_score(y, ensemble_pred, pos_label=0, zero_division=0),
-        "recall_planet":    recall_score(y, ensemble_pred, pos_label=1, zero_division=0),
-        "recall_fp":        recall_score(y, ensemble_pred, pos_label=0, zero_division=0),
-        "roc_auc":          roc_auc_score(y, ensemble_probs),
-        "confusion_matrix": confusion_matrix(y, ensemble_pred),
+        "threshold":        test_thresh,
+        "accuracy":         accuracy_score(y_test, test_pred),
+        "f1_planet":        f1_score(y_test, test_pred, pos_label=1, zero_division=0),
+        "f1_fp":            f1_score(y_test, test_pred, pos_label=0, zero_division=0),
+        "f1_macro":         f1_score(y_test, test_pred, average="macro", zero_division=0),
+        "f1_weighted":      f1_score(y_test, test_pred, average="weighted", zero_division=0),
+        "precision_planet": precision_score(y_test, test_pred, pos_label=1, zero_division=0),
+        "precision_fp":     precision_score(y_test, test_pred, pos_label=0, zero_division=0),
+        "recall_planet":    recall_score(y_test, test_pred, pos_label=1, zero_division=0),
+        "recall_fp":        recall_score(y_test, test_pred, pos_label=0, zero_division=0),
+        "roc_auc":          roc_auc_score(y_test, test_probs),
+        "confusion_matrix": confusion_matrix(y_test, test_pred),
     }
-
-    print(f"  Ensemble AUC-ROC: {ensemble_metrics['roc_auc']:.4f}  |  "
+    print(f"  Test AUC-ROC: {ensemble_metrics['roc_auc']:.4f}  |  "
           f"F1-macro: {ensemble_metrics['f1_macro']:.4f}")
-    print(f"  EB recall: {ensemble_metrics['recall_fp']:.4f}  |  "
-          f"Planet recall: {ensemble_metrics['recall_planet']:.4f}")
 
-    print("\n" + "=" * 67)
-    print("Saving outputs...")
-    save_confusion_matrix(np.mean(all_cms, axis=0),
-                          os.path.join(OUTPUT_DIR, "confusion_matrix.png"))
-    save_metrics_report(fold_metrics, ensemble_metrics, n_total,
-                        os.path.join(OUTPUT_DIR, "metrics_report.txt"))
+    # ── Save outputs ──────────────────────────────────────────────────────────
+    save_confusion_matrix(
+        np.mean(all_cms, axis=0),
+        os.path.join(OUTPUT_DIR, f"confusion_matrix_{tag}.png"),
+    )
+    save_metrics_report(
+        fold_metrics, ensemble_metrics, n_total,
+        os.path.join(OUTPUT_DIR, f"metrics_{tag}.txt"),
+        tag=tag,
+    )
 
-    print("\n" + "=" * 67)
-    print("FINAL CROSS-VALIDATION RESULTS (5-Fold CV Average)")
-    print("=" * 67)
+    print(f"\nCV summary [{tag}]:")
     for key in ["accuracy", "roc_auc", "f1_macro", "recall_fp", "recall_planet"]:
         vals = [m[key] for m in fold_metrics]
-        mean, std = np.mean(vals), np.std(vals)
-        flag = " ✓" if mean >= 0.90 else ""
-        print(f"  {key:<22}  {mean:.4f} ± {std:.4f}{flag}")
+        print(f"  {key:<22}  {np.mean(vals):.4f} ± {np.std(vals):.4f}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Train dual-branch CNN for each per-k training CSV"
+    )
+    parser.add_argument(
+        "csv_files", nargs="*",
+        help="Training CSV paths. If omitted, scans for kepler_training_data_k*.csv"
+    )
+    args = parser.parse_args()
+
+    if args.csv_files:
+        csv_list = args.csv_files
+    else:
+        csv_list = sorted(glob.glob("kepler_training_data_k*_psf*.csv"))
+        if not csv_list:
+            print("No training CSVs found. Run: python getInputData.py --phase csv-only")
+            return
 
     print("\n" + "=" * 67)
-    print("ENSEMBLE RESULTS (5-Fold Average Probabilities)")
+    print("  Kepler Centroid Degradation Study — CNN Training")
     print("=" * 67)
-    for key in ["accuracy", "roc_auc", "f1_macro", "recall_fp", "recall_planet"]:
-        val = ensemble_metrics[key]
-        flag = " ✓" if val >= 0.90 else ""
-        print(f"  {key:<22}  {val:.4f}{flag}")
+    print(f"  Training CSV files: {csv_list}")
+    print(f"  Output dir: {OUTPUT_DIR}")
+    print(f"  Architecture: Dual-Branch 1D CNN (FROZEN)")
+    build_model().summary(line_length=67)
 
-    print("=" * 67)
-    print(f"\nOutputs saved to ./{OUTPUT_DIR}/")
+    for csv_path in csv_list:
+        print("\n" + "=" * 67)
+        print(f"  Processing: {csv_path}")
+        print("=" * 67)
+        _train_and_eval_one_csv(csv_path)
+
+    print("\n" + "=" * 67)
+    print(f"All CSVs processed. Outputs in {OUTPUT_DIR}/")
+    print("Next step: python stats_ml.py")
 
 
 if __name__ == "__main__":
