@@ -583,6 +583,19 @@ def main():
         "--manifest", default="koi_manifest.csv",
         help="Path to KOI manifest CSV (default: koi_manifest.csv)"
     )
+    parser.add_argument(
+        "--tpf-dir", default="./tpf_temp",
+        help=(
+            "Directory for downloaded Kepler TPF FITS files "
+            "(default: ./tpf_temp, which is gitignored). "
+            "If you specify a custom path, add it to .gitignore manually — "
+            "TPF archives can be tens of GB."
+        ),
+    )
+    parser.add_argument(
+        "--cache-dir", default="./cache",
+        help="Directory for computed intermediate cache files (default: ./cache)"
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.manifest):
@@ -593,8 +606,8 @@ def main():
     print(f"Loaded manifest: {len(manifest):,} KOIs, "
           f"{manifest['kepid'].nunique():,} unique KIC targets")
 
-    tpf_dir = "./tpf_temp"
-    cache_dir = "./cache"
+    tpf_dir = args.tpf_dir
+    cache_dir = args.cache_dir
 
     # Clear log files at the start of a fresh run
     if args.phase in ("download", "all"):

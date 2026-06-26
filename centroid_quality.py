@@ -200,6 +200,8 @@ def main():
     parser.add_argument("--k-values", type=int, nargs="+", default=DEFAULT_K_VALUES)
     parser.add_argument("--manifest", default="koi_manifest.csv")
     parser.add_argument("--cache-dir", default="./cache")
+    parser.add_argument("--results-dir", default=RESULTS_DIR,
+                        help="Directory for output files (default: results_resolution)")
     args = parser.parse_args()
 
     if not os.path.exists(args.manifest):
@@ -208,9 +210,11 @@ def main():
 
     manifest = pd.read_csv(args.manifest)
     centroid_dir = os.path.join(args.cache_dir, "centroids")
+    results_dir = args.results_dir
+    figures_dir = os.path.join(results_dir, "figures")
 
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    os.makedirs(FIGURES_DIR, exist_ok=True)
+    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(figures_dir, exist_ok=True)
 
     print(f"Loading centroid quality records from {centroid_dir} ...")
     df = load_quality_records(manifest, centroid_dir, args.k_values)
@@ -221,18 +225,18 @@ def main():
     print(f"Loaded {len(df):,} records ({df['kepid'].nunique():,} unique targets)")
 
     agg = aggregate(df)
-    quality_path = os.path.join(RESULTS_DIR, "centroid_quality.csv")
+    quality_path = os.path.join(results_dir, "centroid_quality.csv")
     agg.to_csv(quality_path, index=False)
     print(f"centroid_quality.csv written to {quality_path}")
 
     scaling = scaling_summary(df)
-    scaling_path = os.path.join(RESULTS_DIR, "centroid_scaling.csv")
+    scaling_path = os.path.join(results_dir, "centroid_scaling.csv")
     scaling.to_csv(scaling_path, index=False)
     print(f"centroid_scaling.csv written to {scaling_path}")
 
     check_scaling_linearity(scaling)
 
-    fig_path = os.path.join(FIGURES_DIR, "fig2_centroid_quality.png")
+    fig_path = os.path.join(figures_dir, "fig2_centroid_quality.png")
     plot_quality(agg, fig_path)
 
 

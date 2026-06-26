@@ -381,6 +381,8 @@ def main():
     parser.add_argument("--n-bootstrap", type=int, default=2000)
     parser.add_argument("--enable-vetting", action="store_true",
                         help="Run vetting package (disabled by default)")
+    parser.add_argument("--results-dir", default=RESULTS_DIR,
+                        help="Directory for output files (default: results_resolution)")
     args = parser.parse_args()
 
     if not os.path.exists(args.manifest):
@@ -388,10 +390,11 @@ def main():
         sys.exit(1)
 
     manifest = pd.read_csv(args.manifest)
-    os.makedirs(RESULTS_DIR, exist_ok=True)
+    results_dir = args.results_dir
+    os.makedirs(results_dir, exist_ok=True)
 
     # Load test kepids from scores CSVs written by theModel.py
-    test_kepids_by_tag = load_test_kepids(RESULTS_DIR)
+    test_kepids_by_tag = load_test_kepids(results_dir)
     if not test_kepids_by_tag:
         print("No scores files found. Run python theModel.py first.")
         sys.exit(1)
@@ -413,7 +416,7 @@ def main():
         print("\nvetting baseline disabled (pass --enable-vetting to enable).")
 
     print(f"\nUpdating breakdown.csv ...")
-    update_breakdown_csv(bryson_results, vetting_results, RESULTS_DIR, args.n_bootstrap)
+    update_breakdown_csv(bryson_results, vetting_results, results_dir, args.n_bootstrap)
 
     print("\nNext step: python compare.py")
 

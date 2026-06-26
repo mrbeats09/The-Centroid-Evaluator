@@ -714,6 +714,8 @@ def _train_and_eval_one_csv(csv_path: str) -> None:
 
 
 def main():
+    global OUTPUT_DIR
+
     parser = argparse.ArgumentParser(
         description="Train dual-branch CNN for each per-k training CSV"
     )
@@ -721,7 +723,14 @@ def main():
         "csv_files", nargs="*",
         help="Training CSV paths. If omitted, scans for kepler_training_data_k*.csv"
     )
+    parser.add_argument(
+        "--results-dir", default=OUTPUT_DIR,
+        help="Directory for scores, metrics, and figures (default: results_resolution)"
+    )
     args = parser.parse_args()
+
+    OUTPUT_DIR = args.results_dir
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     if args.csv_files:
         csv_list = args.csv_files
