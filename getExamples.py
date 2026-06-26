@@ -1,120 +1,182 @@
 """
-getExamples.py — TESS Exoplanet Candidate Manifest Generator
+getExamples.py — Kepler KOI Manifest Generator
 
-Queries the ExoFOP TESS TOI catalog, filters targets by TFOPWG disposition label,
-and writes a manifest CSV (classified_targets.csv) listing the targets to be downloaded.
-The manifest includes ephemeris data (period, epoch, duration) required for phase-folding.
+Queries the NASA Exoplanet Archive KOI cumulative table via TAP/ADQL and writes
+koi_manifest.csv with labelled targets for the centroid-resolution degradation study.
+
+Class definition:
+  Positive (label=1): koi_disposition = CONFIRMED
+  Negative (label=0): koi_disposition = FALSE POSITIVE (all subtypes, default)
+                  OR: koi_disposition = FALSE POSITIVE AND koi_fpflag_co = 1 (--fp-subset centroid_offset)
+
+Group identity: kepid — all KOIs from one KIC star must stay together in CV and test splits.
+
+Usage:
+    python getExamples.py [--fp-subset {all,centroid_offset}]
 """
 
-import pandas as pd
-import requests
+import argparse
 import io
+import sys
+import urllib.parse
+import urllib.request
 
-# Optional magnitude filter to ensure 2-minute cadence data availability
-APPLY_MAG_FILTER = False 
+import pandas as pd
 
-def create_tess_csv():
-    # The direct CSV export link for the TESS Objects of Interest catalog
-    url = "https://exofop.ipac.caltech.edu/tess/download_toi.php?sort=toi&output=csv"
+TAP_URL = "https://exoplanetarchive.ipac.caltech.edu/TAP/sync"
 
-    # Headers to prevent the server from blocking the request
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
+ADQL_QUERY = """
+SELECT kepid, kepoi_name, koi_disposition, koi_pdisposition,
+       koi_fpflag_nt, koi_fpflag_ss, koi_fpflag_co, koi_fpflag_ec,
+       koi_period, koi_time0bk, koi_duration
+FROM cumulative
+""".strip()
 
-    print("Connecting to NASA/ExoFOP servers...")
+FALLBACK_TABLE = "q1_q17_dr25_koi"
 
-    try:
-        # Fetch the data
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
+REQUIRED_COLUMNS = {
+    "kepid", "kepoi_name", "koi_disposition",
+    "koi_fpflag_nt", "koi_fpflag_ss", "koi_fpflag_co", "koi_fpflag_ec",
+    "koi_period", "koi_time0bk", "koi_duration",
+}
 
-        # Load into pandas
-        df = pd.read_csv(io.StringIO(response.text))
 
-        # Clean column names (lowercase and strip whitespace)
-        df.columns = df.columns.str.strip().str.lower()
+def fetch_koi_table(table: str) -> pd.DataFrame:
+    query = ADQL_QUERY.replace("cumulative", table)
+    params = urllib.parse.urlencode({"query": query, "format": "csv"})
+    url = f"{TAP_URL}?{params}"
+    print(f"  Querying {TAP_URL} (table={table}) ...")
+    with urllib.request.urlopen(url, timeout=120) as resp:
+        return pd.read_csv(io.BytesIO(resp.read()))
 
-        # Fix 5: Apply magnitude filter only if enabled (ensures 2-minute cadence availability for bright stars)
-        if APPLY_MAG_FILTER:
-            df = df[df['tess mag'] < 13]
 
-        # Ask the user how many examples they want
-        false_num = int(input("How many false positives do you want to download? - "))
-        true_num = int(input("How many true positives do you want to download? - "))
+def fp_subtype(row: pd.Series) -> str:
+    """Encode which FP flags are set as a short string for subgroup analysis."""
+    if row["label"] == 1:
+        return "planet"
+    parts = []
+    if row.get("koi_fpflag_co", 0) == 1:
+        parts.append("co")
+    if row.get("koi_fpflag_ss", 0) == 1:
+        parts.append("ss")
+    if row.get("koi_fpflag_nt", 0) == 1:
+        parts.append("nt")
+    if row.get("koi_fpflag_ec", 0) == 1:
+        parts.append("ec")
+    return "+".join(parts) if parts else "other"
 
-        # Fix 2: Expand the label pools
-        # Positives: KP (Confirmed Planet), CP (Candidate Planet), PC (Planet Candidate)
-        # Negatives: FP (False Positive), EB (Eclipsing Binary), NEB (Non-Eclipsing Binary)
-        # Exclusions: FA, APC are dropped entirely
-        positives_mask = df['tfopwg disposition'].isin(['KP', 'CP', 'PC'])
-        negatives_mask = df['tfopwg disposition'].isin(['FP', 'EB', 'NEB'])
 
-        positives_pool = df[positives_mask]
-        negatives_pool = df[negatives_mask]
+def main():
+    parser = argparse.ArgumentParser(description="Build KOI manifest for degradation study")
+    parser.add_argument(
+        "--fp-subset",
+        choices=["all", "centroid_offset"],
+        default="all",
+        help=(
+            "all (default): all FALSE POSITIVE subtypes as negatives; "
+            "centroid_offset: only FPs with koi_fpflag_co=1"
+        ),
+    )
+    args = parser.parse_args()
 
-        # Fix 4: Drop rows with null or zero ephemeris values before sampling
-        # These cannot be phase-folded and would cause failures downstream
-        def drop_null_ephemeris(pool, device_name):
-            initial_len = len(pool)
-            pool = pool.dropna(subset=['period (days)', 'epoch (bjd)', 'duration (hours)'])
-            pool = pool[(pool['period (days)'] != 0) &
-                       (pool['epoch (bjd)'] != 0) &
-                       (pool['duration (hours)'] != 0)]
-            dropped = initial_len - len(pool)
-            if dropped > 0:
-                print(f"  {device_name}: Dropped {dropped} rows with null/zero ephemeris values")
-            return pool
+    # Fetch from primary table; fall back on column-name mismatch or HTTP error
+    df = None
+    for table in ["cumulative", FALLBACK_TABLE]:
+        try:
+            df = fetch_koi_table(table)
+            missing = REQUIRED_COLUMNS - set(df.columns)
+            if missing:
+                print(f"  Table '{table}' missing columns: {missing}. Trying fallback...")
+                df = None
+                continue
+            print(f"  Fetched {len(df):,} rows from '{table}'.")
+            break
+        except Exception as exc:
+            print(f"  Table '{table}' failed ({exc}). Trying fallback...")
 
-        positives_pool = drop_null_ephemeris(positives_pool, "Positives")
-        negatives_pool = drop_null_ephemeris(negatives_pool, "Negatives")
+    if df is None:
+        print("ERROR: could not fetch KOI table from either source. Check network access.")
+        sys.exit(1)
 
-        # Fix 3: Use .sample() instead of .head() to avoid systematic bias toward early rows
-        # If either pool is too small, reduce both to match and warn the user
-        true_available = len(positives_pool)
-        false_available = len(negatives_pool)
+    # Drop rows with null or zero ephemerides — these cannot be phase-folded
+    n_before = len(df)
+    df = df.dropna(subset=["koi_period", "koi_time0bk", "koi_duration"])
+    df = df[
+        (df["koi_period"] > 0) &
+        (df["koi_time0bk"] > 0) &
+        (df["koi_duration"] > 0)
+    ]
+    print(f"  Dropped {n_before - len(df):,} rows with null/zero ephemerides.")
 
-        if true_available < true_num or false_available < false_num:
-            actual_true_num = min(true_num, true_available)
-            actual_false_num = min(false_num, false_available)
-            # Reduce both to the minimum to maintain balance
-            actual_true_num = min(actual_true_num, actual_false_num)
-            actual_false_num = actual_true_num
-            print(f"\nWARNING: Requested {true_num} positives and {false_num} negatives, but only "
-                  f"{true_available} positives and {false_available} negatives available after filtering.")
-            print(f"Sampling {actual_true_num} of each class for balance.")
-        else:
-            actual_true_num = true_num
-            actual_false_num = false_num
+    # Fill FP flag NaNs with 0
+    for col in ["koi_fpflag_nt", "koi_fpflag_ss", "koi_fpflag_co", "koi_fpflag_ec"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 
-        # Sample randomly but reproducibly with random_state=42
-        if actual_true_num > 0 and len(positives_pool) > 0:
-            positives = positives_pool.sample(n=actual_true_num, random_state=42)
-        else:
-            positives = pd.DataFrame()
+    # Build label column
+    disp = df["koi_disposition"].str.strip().str.upper()
+    confirmed_mask = disp == "CONFIRMED"
+    fp_mask = disp == "FALSE POSITIVE"
 
-        if actual_false_num > 0 and len(negatives_pool) > 0:
-            negatives = negatives_pool.sample(n=actual_false_num, random_state=42)
-        else:
-            negatives = pd.DataFrame()
+    if args.fp_subset == "centroid_offset":
+        # Option B: restrict negatives to centroid-offset FPs only
+        neg_mask = fp_mask & (df["koi_fpflag_co"] == 1)
+        print("\nDataset mode: Option B — centroid-offset FPs only (koi_fpflag_co=1).")
+        print("NOTE: This focuses on the FP subtype centroid methods are designed to detect.")
+        print("      AUC numbers may be optimistic; document this limitation in the paper.")
+    else:
+        # Option A (default): all FP subtypes
+        neg_mask = fp_mask
+        print("\nDataset mode: Option A — all FALSE POSITIVE subtypes as negatives.")
+        print("  Subgroup performance (co/ss/nt/ec) will be reported separately.")
 
-        # Fix 1: Include ephemeris columns in the manifest
-        relevant_columns = [
-            'tic id', 'toi', 'tfopwg disposition',
-            'period (days)', 'epoch (bjd)', 'duration (hours)', 'sectors'
-        ]
+    positives = df[confirmed_mask].copy()
+    negatives = df[neg_mask].copy()
 
-        # Combine positives and negatives
-        final_data = pd.concat([positives, negatives])[relevant_columns]
+    positives["label"] = 1
+    negatives["label"] = 0
 
-        # Save to CSV
-        final_data.to_csv("classified_targets.csv", index=False)
+    manifest = pd.concat([positives, negatives], ignore_index=True)
+    manifest["fp_subtype"] = manifest.apply(fp_subtype, axis=1)
 
-        print(f"\nSuccess! Created 'classified_targets.csv' with {len(final_data)} examples in total.")
-        print(f"Contains: {len(positives)} Positive Targets (KP/CP/PC), {len(negatives)} Negative Targets (FP/EB/NEB)")
+    # Keep provenance columns; rename for clarity
+    out = manifest[[
+        "kepid", "kepoi_name", "label", "fp_subtype",
+        "koi_disposition", "koi_pdisposition",
+        "koi_fpflag_nt", "koi_fpflag_ss", "koi_fpflag_co", "koi_fpflag_ec",
+        "koi_period", "koi_time0bk", "koi_duration",
+    ]].copy()
 
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    # koi_time0bk is BKJD (BJD − 2454833.0) — use directly; do not subtract 2457000
+    out.to_csv("koi_manifest.csv", index=False)
+
+    # Print summary
+    n_pos = (out["label"] == 1).sum()
+    n_neg = (out["label"] == 0).sum()
+    n_kic = out["kepid"].nunique()
+    print(f"\nWrote koi_manifest.csv — {len(out):,} total KOIs from {n_kic:,} unique KIC targets")
+    print(f"  Positives (CONFIRMED):  {n_pos:,}")
+    print(f"  Negatives (FP):         {n_neg:,}")
+
+    if args.fp_subset == "all" and n_neg > 0:
+        fp_df = out[out["label"] == 0]
+        print("\n  FP subgroup breakdown:")
+        for subtype, count in fp_df["fp_subtype"].value_counts().items():
+            print(f"    {subtype}: {count:,}")
+
+        n_co = int((out["koi_fpflag_co"] == 1).sum())
+        n_ss = int((out["koi_fpflag_ss"] == 1).sum())
+        n_no_centroid = int(fp_df[fp_df["koi_fpflag_co"] == 0].shape[0])
+        print(f"\n  Of {n_neg:,} FP negatives:")
+        print(f"    centroid-offset (koi_fpflag_co=1): {n_co:,}")
+        print(f"    significant-secondary (koi_fpflag_ss=1, co=0): {n_ss - n_co if n_ss >= n_co else n_ss:,} (approx)")
+        print(f"    without centroid offset flag: {n_no_centroid:,}")
+        print(
+            "\n  On-target EBs (koi_fpflag_ss=1, koi_fpflag_co=0) are INCLUDED as negatives "
+            "(Option A). These have no centroid signature; subgroup reporting lets the paper "
+            "discuss their effect on classification performance without baking the answer into "
+            "the dataset. See CLAUDE.md for the Option A / Option B tradeoff."
+        )
+
 
 if __name__ == "__main__":
-    create_tess_csv()
+    main()
