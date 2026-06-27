@@ -26,6 +26,7 @@ import argparse
 import os
 import sys
 import threading
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -70,7 +71,7 @@ def enable_cloud_storage() -> bool:
     """
     Enable anonymous S3 access to the MAST public data bucket (s3://stpubdata).
     When active, lightkurve routes downloads through AWS rather than MAST HTTPS,
-    giving 10–30x higher throughput at no cost (bucket is public/anonymous).
+    giving ~3x higher throughput per connection at no cost (bucket is public).
     Returns True if S3 was successfully enabled, False if falling back to MAST HTTPS.
     """
     try:
@@ -83,33 +84,90 @@ def enable_cloud_storage() -> bool:
         return False
 
 
-def _download_one_target(
+class _MastRateLimiter:
+    """
+    Token-bucket rate limiter for MAST search API calls.
+
+    MAST starts returning 429s or stalling connections at roughly 3-5 concurrent
+    search queries. This limiter enforces a ceiling of `calls_per_second` search
+    requests globally across all threads, while leaving S3 data downloads (which
+    hit AWS, not MAST) completely unrestricted.
+    """
+
+    def __init__(self, calls_per_second: float = 3.0):
+        self._min_interval = 1.0 / calls_per_second
+        self._lock = threading.Lock()
+        self._last_call: float = 0.0
+
+    def __enter__(self):
+        with self._lock:
+            now = time.monotonic()
+            gap = self._min_interval - (now - self._last_call)
+            if gap > 0:
+                time.sleep(gap)
+            self._last_call = time.monotonic()
+        return self
+
+    def __exit__(self, *_):
+        pass
+
+
+def _search_with_retry(
     kepid: int,
-    tpf_dir: str,
     max_quarters: int | None,
+    rate_limiter: _MastRateLimiter,
+    max_retries: int = 5,
+) -> tuple:
+    """
+    Query the MAST search API for one kepid, respecting the rate limiter and
+    retrying on transient failures (429, connection errors) with exponential backoff.
+    Returns a lightkurve SearchResult, or None if the target has no data.
+    Raises on permanent failure after max_retries attempts.
+    """
+    for attempt in range(max_retries):
+        try:
+            with rate_limiter:
+                result = lk.search_targetpixelfile(
+                    f"KIC {kepid}", mission="Kepler", cadence="long"
+                )
+            if len(result) == 0:
+                return None
+            if max_quarters is not None and len(result) > max_quarters:
+                result = result[:max_quarters]
+            return result
+        except Exception as exc:
+            if attempt == max_retries - 1:
+                raise
+            # Exponential backoff: 2s, 4s, 8s, 16s
+            backoff = 2 ** (attempt + 1)
+            time.sleep(backoff)
+    return None
+
+
+def _download_with_retry(
+    kepid: int,
+    search_result,
+    tpf_dir: str,
+    max_retries: int = 4,
 ) -> tuple[int, bool, str]:
     """
-    Download TPFs for a single kepid. Designed to run inside a thread pool.
+    Download TPFs for one kepid given a pre-fetched SearchResult.
+    Retries S3/network failures with exponential backoff.
+    The MAST search is NOT repeated here — that already happened in the search phase.
     Returns (kepid, success, error_message).
     """
-    try:
-        search = lk.search_targetpixelfile(
-            f"KIC {kepid}", mission="Kepler", cadence="long"
-        )
-        if len(search) == 0:
-            return kepid, False, "No Kepler long-cadence TPFs found"
-
-        if max_quarters is not None and len(search) > max_quarters:
-            search = search[:max_quarters]
-
-        search.download_all(
-            quality_bitmask="default",
-            download_dir=tpf_dir,
-        )
-        return kepid, True, ""
-
-    except Exception as exc:
-        return kepid, False, f"{type(exc).__name__}: {exc}"
+    for attempt in range(max_retries):
+        try:
+            search_result.download_all(
+                quality_bitmask="default",
+                download_dir=tpf_dir,
+            )
+            return kepid, True, ""
+        except Exception as exc:
+            if attempt == max_retries - 1:
+                return kepid, False, f"{type(exc).__name__}: {exc}"
+            time.sleep(2 ** (attempt + 1))
+    return kepid, False, "exceeded max retries"
 
 
 def download_tpfs(
@@ -117,32 +175,62 @@ def download_tpfs(
     tpf_dir: str,
     max_quarters: int | None,
     n_workers: int = 8,
+    search_rate: float = 3.0,
 ) -> None:
     """
     Download Kepler long-cadence TPFs for each unique kepid in the manifest.
 
-    Uses a ThreadPoolExecutor with n_workers concurrent downloads. lightkurve's
-    built-in caching means existing files are skipped automatically. S3 must be
-    enabled before calling this (via enable_cloud_storage()) for maximum speed.
-    Failures are logged to failed_targets.log.
+    Two-phase design that separates the MAST-rate-limited search from the
+    S3 downloads (which have no meaningful rate limit):
+
+      Phase 1a — MAST search queries (serial, rate-limited to search_rate/sec).
+                 Retries with exponential backoff on transient failures.
+      Phase 1b — S3 data downloads (parallel, n_workers threads, retry on error).
+
+    This prevents 429 / connection-stall errors from MAST while still saturating
+    your S3 download bandwidth.
     """
     os.makedirs(tpf_dir, exist_ok=True)
     unique_kepids = manifest["kepid"].unique()
-
     quarters_note = f", capped at {max_quarters} quarters" if max_quarters else ""
-    print(f"\nPhase 1: Downloading TPFs for {len(unique_kepids):,} unique KIC targets"
-          f" ({n_workers} workers{quarters_note}) ...")
 
+    print(f"\nPhase 1a: Querying MAST for {len(unique_kepids):,} targets "
+          f"(rate-limited to {search_rate:.0f} req/s{quarters_note}) ...")
+
+    rate_limiter = _MastRateLimiter(calls_per_second=search_rate)
+    search_results: dict[int, object] = {}   # kepid → SearchResult
+    search_failed: list[str] = []
+
+    for kepid in tqdm(unique_kepids, desc="MAST search", unit="target"):
+        try:
+            result = _search_with_retry(kepid, max_quarters, rate_limiter)
+            if result is None:
+                search_failed.append(f"KIC {kepid}: No Kepler long-cadence TPFs found")
+            else:
+                search_results[kepid] = result
+        except Exception as exc:
+            search_failed.append(f"KIC {kepid}: search failed: {type(exc).__name__}: {exc}")
+
+    for msg in search_failed:
+        log_failure("failed_targets.log", msg)
+
+    print(f"Phase 1a complete: {len(search_results):,} targets found, "
+          f"{len(search_failed):,} not found / failed.")
+
+    if not search_results:
+        print("No targets to download.")
+        return
+
+    print(f"\nPhase 1b: Downloading TPFs ({n_workers} concurrent S3 workers) ...")
     success = failed = 0
-    # Lock protects counter updates from concurrent threads
     lock = threading.Lock()
 
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         futures = {
-            executor.submit(_download_one_target, kepid, tpf_dir, max_quarters): kepid
-            for kepid in unique_kepids
+            executor.submit(_download_with_retry, kepid, sr, tpf_dir): kepid
+            for kepid, sr in search_results.items()
         }
-        with tqdm(total=len(unique_kepids), desc="Downloading TPFs", unit="target") as pbar:
+        with tqdm(total=len(search_results), desc="S3 downloads", unit="target") as pbar:
             for future in as_completed(futures):
                 kepid, ok, err = future.result()
                 with lock:
@@ -153,7 +241,7 @@ def download_tpfs(
                         log_failure("failed_targets.log", f"KIC {kepid}: {err}")
                 pbar.update(1)
 
-    print(f"Phase 1 complete: {success:,} targets downloaded, {failed:,} failed.")
+    print(f"Phase 1 complete: {success:,} downloaded, {failed:,} failed.")
 
 
 # ============================================================================
@@ -650,9 +738,15 @@ def main():
     parser.add_argument(
         "--workers", type=int, default=8,
         help=(
-            "Number of concurrent TPF download threads (default: 8). "
-            "Values above 8-10 risk soft-throttling from MAST. "
+            "Number of concurrent S3 download threads (default: 8). "
             "Has no effect with --phase csv-only."
+        ),
+    )
+    parser.add_argument(
+        "--search-rate", type=float, default=3.0,
+        help=(
+            "Max MAST search API calls per second (default: 3.0). "
+            "Raise cautiously — MAST soft-throttles at ~5 req/s."
         ),
     )
     args = parser.parse_args()
@@ -681,7 +775,11 @@ def main():
 
     if run_download:
         enable_cloud_storage()
-        download_tpfs(manifest, tpf_dir, args.max_quarters, n_workers=args.workers)
+        download_tpfs(
+            manifest, tpf_dir, args.max_quarters,
+            n_workers=args.workers,
+            search_rate=args.search_rate,
+        )
 
     if run_cache:
         build_cache(manifest, tpf_dir, cache_dir, args.k_values, args.max_quarters)

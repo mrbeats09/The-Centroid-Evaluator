@@ -118,7 +118,11 @@ def main():
     )
     parser.add_argument(
         "--workers", type=int, default=8,
-        help="Concurrent download threads for Stage 2 (default: 8; do not exceed 10)",
+        help="Concurrent S3 download threads for Stage 2 (default: 8)",
+    )
+    parser.add_argument(
+        "--search-rate", type=float, default=3.0,
+        help="MAST search API rate limit in requests/sec (default: 3.0; max safe ~5.0)",
     )
     parser.add_argument(
         "--k-values", type=int, nargs="+", default=[1, 2, 3, 4, 5],
@@ -184,6 +188,7 @@ def main():
              "--tpf-dir", args.tpf_dir,
              "--cache-dir", args.cache_dir,
              "--workers", str(args.workers),
+             "--search-rate", str(args.search_rate),
              *(["--max-quarters", str(args.max_quarters)] if args.max_quarters else []),
              ] + k_flags + manifest_f,
             None,   # always run; internal caching handles skip-if-present per file
@@ -260,7 +265,8 @@ def main():
     print("║      Kepler Centroid-Resolution Degradation Pipeline         ║")
     print("╚══════════════════════════════════════════════════════════════╝")
     print(f"  k values     : {args.k_values}")
-    print(f"  Workers      : {args.workers} concurrent download threads")
+    print(f"  Workers      : {args.workers} concurrent S3 download threads")
+    print(f"  Search rate  : {args.search_rate} MAST API req/s (rate-limited)")
     print(f"  TPF dir      : {args.tpf_dir}")
     print(f"  Cache dir    : {args.cache_dir}")
     print(f"  Manifest     : {args.manifest}")
