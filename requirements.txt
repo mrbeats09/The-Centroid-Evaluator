@@ -9,6 +9,8 @@ astropy>=5.3.0
 tqdm>=4.65.0
 matplotlib>=3.7.0
 aiohttp>=3.8.0
+boto3>=1.35.0
+s3fs>=2024.6.1
 
 # Optional: vetting baseline (only needed with --enable-vetting)
 # pip install vetting

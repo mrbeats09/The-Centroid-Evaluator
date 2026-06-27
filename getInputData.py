@@ -25,7 +25,9 @@ Do NOT subtract 2457000 (that is the TESS BTJD offset).
 import argparse
 import os
 import sys
+import threading
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -64,43 +66,92 @@ def log_failure(path: str, msg: str) -> None:
 # Phase 1: TPF download
 # ============================================================================
 
-def download_tpfs(manifest: pd.DataFrame, tpf_dir: str, max_quarters: int | None) -> None:
+def enable_cloud_storage() -> bool:
+    """
+    Enable anonymous S3 access to the MAST public data bucket (s3://stpubdata).
+    When active, lightkurve routes downloads through AWS rather than MAST HTTPS,
+    giving 10–30x higher throughput at no cost (bucket is public/anonymous).
+    Returns True if S3 was successfully enabled, False if falling back to MAST HTTPS.
+    """
+    try:
+        from astroquery.mast import Observations
+        Observations.enable_cloud_dataset(provider="AWS", profile="anon")
+        print("  S3 cloud storage enabled (s3://stpubdata) — downloads will prefer AWS.")
+        return True
+    except Exception as exc:
+        print(f"  S3 unavailable ({exc}); falling back to MAST HTTPS.")
+        return False
+
+
+def _download_one_target(
+    kepid: int,
+    tpf_dir: str,
+    max_quarters: int | None,
+) -> tuple[int, bool, str]:
+    """
+    Download TPFs for a single kepid. Designed to run inside a thread pool.
+    Returns (kepid, success, error_message).
+    """
+    try:
+        search = lk.search_targetpixelfile(
+            f"KIC {kepid}", mission="Kepler", cadence="long"
+        )
+        if len(search) == 0:
+            return kepid, False, "No Kepler long-cadence TPFs found"
+
+        if max_quarters is not None and len(search) > max_quarters:
+            search = search[:max_quarters]
+
+        search.download_all(
+            quality_bitmask="default",
+            download_dir=tpf_dir,
+        )
+        return kepid, True, ""
+
+    except Exception as exc:
+        return kepid, False, f"{type(exc).__name__}: {exc}"
+
+
+def download_tpfs(
+    manifest: pd.DataFrame,
+    tpf_dir: str,
+    max_quarters: int | None,
+    n_workers: int = 8,
+) -> None:
     """
     Download Kepler long-cadence TPFs for each unique kepid in the manifest.
-    Uses lightkurve's built-in caching (tpf_temp/); existing files are skipped.
+
+    Uses a ThreadPoolExecutor with n_workers concurrent downloads. lightkurve's
+    built-in caching means existing files are skipped automatically. S3 must be
+    enabled before calling this (via enable_cloud_storage()) for maximum speed.
     Failures are logged to failed_targets.log.
     """
     os.makedirs(tpf_dir, exist_ok=True)
     unique_kepids = manifest["kepid"].unique()
+
+    quarters_note = f", capped at {max_quarters} quarters" if max_quarters else ""
     print(f"\nPhase 1: Downloading TPFs for {len(unique_kepids):,} unique KIC targets"
-          f"{f' (capped at {max_quarters} quarters)' if max_quarters else ''}...")
+          f" ({n_workers} workers{quarters_note}) ...")
 
-    success, failed = 0, 0
-    for kepid in tqdm(unique_kepids, desc="Downloading TPFs", unit="target"):
-        try:
-            search = lk.search_targetpixelfile(
-                f"KIC {kepid}", mission="Kepler", cadence="long"
-            )
-            if len(search) == 0:
-                log_failure("failed_targets.log",
-                            f"KIC {kepid}: No Kepler long-cadence TPFs found")
-                failed += 1
-                continue
+    success = failed = 0
+    # Lock protects counter updates from concurrent threads
+    lock = threading.Lock()
 
-            if max_quarters is not None and len(search) > max_quarters:
-                # Sort by quarter (lightkurve exposes quarter attribute on search results)
-                search = search[:max_quarters]
-
-            search.download_all(
-                quality_bitmask="default",
-                download_dir=tpf_dir,
-            )
-            success += 1
-
-        except Exception as exc:
-            log_failure("failed_targets.log",
-                        f"KIC {kepid}: {type(exc).__name__}: {exc}")
-            failed += 1
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = {
+            executor.submit(_download_one_target, kepid, tpf_dir, max_quarters): kepid
+            for kepid in unique_kepids
+        }
+        with tqdm(total=len(unique_kepids), desc="Downloading TPFs", unit="target") as pbar:
+            for future in as_completed(futures):
+                kepid, ok, err = future.result()
+                with lock:
+                    if ok:
+                        success += 1
+                    else:
+                        failed += 1
+                        log_failure("failed_targets.log", f"KIC {kepid}: {err}")
+                pbar.update(1)
 
     print(f"Phase 1 complete: {success:,} targets downloaded, {failed:,} failed.")
 
@@ -596,6 +647,14 @@ def main():
         "--cache-dir", default="./cache",
         help="Directory for computed intermediate cache files (default: ./cache)"
     )
+    parser.add_argument(
+        "--workers", type=int, default=8,
+        help=(
+            "Number of concurrent TPF download threads (default: 8). "
+            "Values above 8-10 risk soft-throttling from MAST. "
+            "Has no effect with --phase csv-only."
+        ),
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.manifest):
@@ -621,7 +680,8 @@ def main():
     run_csv = args.phase in ("csv-only", "all")
 
     if run_download:
-        download_tpfs(manifest, tpf_dir, args.max_quarters)
+        enable_cloud_storage()
+        download_tpfs(manifest, tpf_dir, args.max_quarters, n_workers=args.workers)
 
     if run_cache:
         build_cache(manifest, tpf_dir, cache_dir, args.k_values, args.max_quarters)
