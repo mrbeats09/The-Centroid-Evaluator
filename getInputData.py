@@ -24,6 +24,7 @@ Do NOT subtract 2457000 (that is the TESS BTJD offset).
 
 import argparse
 import os
+import pickle
 import sys
 import threading
 import time
@@ -82,6 +83,43 @@ def enable_cloud_storage() -> bool:
     except Exception as exc:
         print(f"  S3 unavailable ({exc}); falling back to MAST HTTPS.")
         return False
+
+
+# ============================================================================
+# Search result cache (phase 1a resumability)
+# ============================================================================
+
+def _search_cache_path(cache_dir: str, kepid: int) -> str:
+    return os.path.join(cache_dir, "search", f"{kepid}.pkl")
+
+
+def _load_cached_search(cache_dir: str, kepid: int):
+    """
+    Return a cached SearchResult (or None = confirmed no data) if this kepid
+    has been queried before. Returns the sentinel _NOT_CACHED if not found.
+    """
+    path = _search_cache_path(cache_dir, kepid)
+    if not os.path.exists(path):
+        return _NOT_CACHED
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return _NOT_CACHED  # corrupt cache entry: re-query
+
+
+def _save_cached_search(cache_dir: str, kepid: int, result) -> None:
+    """Persist a SearchResult (or None) for this kepid immediately after querying."""
+    os.makedirs(os.path.join(cache_dir, "search"), exist_ok=True)
+    path = _search_cache_path(cache_dir, kepid)
+    try:
+        with open(path, "wb") as f:
+            pickle.dump(result, f, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        pass  # non-fatal: worst case we re-query on next run
+
+
+_NOT_CACHED = object()  # sentinel distinct from None ("confirmed no data")
 
 
 class _MastRateLimiter:
@@ -173,6 +211,7 @@ def _download_with_retry(
 def download_tpfs(
     manifest: pd.DataFrame,
     tpf_dir: str,
+    cache_dir: str,
     max_quarters: int | None,
     n_workers: int = 8,
     search_rate: float = 3.0,
@@ -184,8 +223,11 @@ def download_tpfs(
     S3 downloads (which have no meaningful rate limit):
 
       Phase 1a — MAST search queries (serial, rate-limited to search_rate/sec).
-                 Retries with exponential backoff on transient failures.
+                 Each result is cached to cache/search/{kepid}.pkl immediately,
+                 so the process can be interrupted and resumed without re-querying
+                 targets that have already been searched.
       Phase 1b — S3 data downloads (parallel, n_workers threads, retry on error).
+                 lightkurve's file cache means existing FITS files are skipped.
 
     This prevents 429 / connection-stall errors from MAST while still saturating
     your S3 download bandwidth.
@@ -194,21 +236,40 @@ def download_tpfs(
     unique_kepids = manifest["kepid"].unique()
     quarters_note = f", capped at {max_quarters} quarters" if max_quarters else ""
 
+    # ── Phase 1a: MAST search (with per-kepid disk cache) ───────────────────
+
+    # Separate kepids into already-cached vs. need-to-query
+    cached_results: dict[int, object] = {}
+    to_query: list[int] = []
+    for kepid in unique_kepids:
+        hit = _load_cached_search(cache_dir, kepid)
+        if hit is _NOT_CACHED:
+            to_query.append(kepid)
+        elif hit is not None:
+            cached_results[kepid] = hit
+        # hit is None → confirmed no data; skip silently
+
+    n_cached = len(cached_results) + (len(unique_kepids) - len(to_query) - len(cached_results))
     print(f"\nPhase 1a: Querying MAST for {len(unique_kepids):,} targets "
           f"(rate-limited to {search_rate:.0f} req/s{quarters_note}) ...")
+    if n_cached:
+        print(f"  ↳ {len(unique_kepids) - len(to_query):,} already cached — "
+              f"querying {len(to_query):,} new targets.")
 
     rate_limiter = _MastRateLimiter(calls_per_second=search_rate)
-    search_results: dict[int, object] = {}   # kepid → SearchResult
+    search_results: dict[int, object] = dict(cached_results)
     search_failed: list[str] = []
 
-    for kepid in tqdm(unique_kepids, desc="MAST search", unit="target"):
+    for kepid in tqdm(to_query, desc="MAST search", unit="target"):
         try:
             result = _search_with_retry(kepid, max_quarters, rate_limiter)
+            _save_cached_search(cache_dir, kepid, result)  # None = confirmed no data
             if result is None:
                 search_failed.append(f"KIC {kepid}: No Kepler long-cadence TPFs found")
             else:
                 search_results[kepid] = result
         except Exception as exc:
+            # Do not cache failures — allow retry on next run
             search_failed.append(f"KIC {kepid}: search failed: {type(exc).__name__}: {exc}")
 
     for msg in search_failed:
@@ -776,7 +837,7 @@ def main():
     if run_download:
         enable_cloud_storage()
         download_tpfs(
-            manifest, tpf_dir, args.max_quarters,
+            manifest, tpf_dir, cache_dir, args.max_quarters,
             n_workers=args.workers,
             search_rate=args.search_rate,
         )
