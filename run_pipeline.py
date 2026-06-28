@@ -14,6 +14,7 @@ Stages (in order):
   6. stats_ml.py          — bootstrap AUC CIs + breakdown resolution
   7. baselines.py         — Bryson baseline (+ optional vetting)
   8. compare.py           — assemble comparison.csv, report.md, figures
+  9. graphs.py            — AUC vs scale, ablation, threshold-crossing figures
 
 Usage:
   python run_pipeline.py [options]
@@ -49,7 +50,7 @@ def run_step(
         cmd:             command + arguments list
         skip_if_exists:  if this path already exists, skip the step and print a note
     """
-    header = f"[{step_num}/8] {label}"
+    header = f"[{step_num}/9] {label}"
     separator = "─" * 60
 
     if skip_if_exists and os.path.exists(skip_if_exists):
@@ -71,7 +72,9 @@ def run_step(
         print(f"\n{'═' * 60}")
         print(f"PIPELINE ABORTED at step {step_num}: {label}")
         print(f"Exit code: {exc.returncode}  (elapsed: {elapsed:.1f}s)")
-        print(f"Fix the error above and re-run. Steps 1–{step_num - 1} are cached.")
+        print(f"Fix the error above and re-run. "
+              f"Use --start-from {step_num} to resume. "
+              f"Steps 1–{step_num - 1} outputs are cached.")
         print(f"{'═' * 60}")
         sys.exit(exc.returncode)
 
@@ -153,7 +156,7 @@ def main():
     parser.add_argument(
         "--start-from", type=int, default=1, metavar="STEP",
         help=(
-            "Skip steps before this number (1–8). Useful for resuming after a failure. "
+            "Skip steps before this number (1–9). Useful for resuming after a failure. "
             "Caching means earlier outputs are still on disk."
         ),
     )
@@ -257,6 +260,15 @@ def main():
              "--k-values"] + k_str + manifest_f,
             None,   # always run; cheap read-only assembly
         ),
+
+        # Step 9 — Publication figures (AUC vs scale, ablation, threshold-crossing)
+        (
+            9, "Generate publication figures (graphs.py)",
+            [PYTHON, "graphs.py",
+             "--results-dir", args.results_dir,
+             ],
+            None,   # always run; pure read-only; fast
+        ),
     ]
 
     # ── print run plan ───────────────────────────────────────────────────────
@@ -280,7 +292,7 @@ def main():
 
     for step_num, label, cmd, skip_sentinel in steps:
         if step_num < args.start_from:
-            print(f"\n[{step_num}/8] {label}  →  skipped (--start-from {args.start_from})")
+            print(f"\n[{step_num}/9] {label}  →  skipped (--start-from {args.start_from})")
             continue
         run_step(step_num, label, cmd, skip_sentinel)
 

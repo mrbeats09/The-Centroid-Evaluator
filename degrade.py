@@ -11,6 +11,14 @@ any specific telescope. k is a scan through the spatial-sampling control
 parameter. All k values are referred to by their effective scale 3.98·k arcsec;
 the TESS pixel scale (~21 arcsec) is mentioned only for orientation.
 
+Noise policy: No synthetic noise is added at any degradation level.
+Rebinning alone redistributes existing Kepler photon noise into fewer pixels.
+Gaussian PSF broadening (psf=1) broadens the effective PSF without adding noise.
+This is a deliberate design choice that isolates spatial sampling as the sole
+independent variable. Results at high k therefore represent a lower bound on
+degradation relative to a real coarser instrument, which would additionally
+suffer from sky background and read noise scaling.
+
 PSF broadening (optional, default OFF):
   Rebinning alone coarsens spatial *sampling* but preserves Kepler's narrow
   optical PSF. A physically broader effective PSF is modelled by convolving

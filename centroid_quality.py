@@ -225,9 +225,31 @@ def main():
     print(f"Loaded {len(df):,} records ({df['kepid'].nunique():,} unique targets)")
 
     agg = aggregate(df)
+
+    # Fix 16: Assert required columns are present before writing.
+    # These columns are consumed by stats_ml.py (k_break_snr), graphs.py, and compare.py.
+    required_agg_cols = [
+        "median_centroid_snr",
+        "median_centroid_rms",
+        "median_centroid_uncertainty",
+        "median_offset_arcsec",
+    ]
+    missing_cols = [c for c in required_agg_cols if c not in agg.columns]
+    assert not missing_cols, (
+        f"aggregate() output is missing expected columns: {missing_cols}. "
+        f"Check that cache/centroids/*.npz files contain the required keys."
+    )
+
     quality_path = os.path.join(results_dir, "centroid_quality.csv")
     agg.to_csv(quality_path, index=False)
     print(f"centroid_quality.csv written to {quality_path}")
+
+    # Fix 16: Also write the raw per-target records so stats_ml.py can filter
+    # to test kepids when computing k_break_snr (avoids leakage from train targets).
+    per_target_path = os.path.join(results_dir, "centroid_quality_per_target.csv")
+    df.to_csv(per_target_path, index=False)
+    print(f"centroid_quality_per_target.csv written to {per_target_path} "
+          f"({len(df):,} records)")
 
     scaling = scaling_summary(df)
     scaling_path = os.path.join(results_dir, "centroid_scaling.csv")

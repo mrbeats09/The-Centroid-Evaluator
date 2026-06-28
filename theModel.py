@@ -15,8 +15,10 @@ channel 0 exactly as before.
 Changes from the prior TESS version:
   - CV uses StratifiedGroupKFold keyed on kepid (no KIC target leakage)
   - 20% held-out test set, split at kepid level before any CV
+  - Ensemble threshold fixed from OOF CV predictions (not test-set optimised)
   - Outer loop over per-k training CSVs (kepler_training_data_k{K}_psf{P}.csv)
   - Per-k test scores saved to results_resolution/scores_k{K}_psf{P}.csv
+  - Ablation study (flux-only, centroid-only) for psf=0 CSVs
   - OUTPUT_DIR → results_resolution/
 
 All other code (focal loss, optimiser, LR schedule, augmentations, architecture)
@@ -26,6 +28,8 @@ Outputs (per k, psf):
   - results_resolution/scores_k{K}_psf{P}.csv  — per-target test-set scores
   - results_resolution/metrics_k{K}_psf{P}.txt — per-fold + ensemble metrics
   - results_resolution/confusion_matrix_k{K}_psf{P}.png
+  - results_resolution/scores_k{K}_psf0_flux_only.csv    (psf=0 only)
+  - results_resolution/scores_k{K}_psf0_centroid_only.csv (psf=0 only)
 """
 
 import argparse
@@ -169,8 +173,8 @@ class AugmentedSequence(Sequence):
             X_batch[i, :, 0] += np.random.normal(0, 0.02, NUM_BINS).astype(np.float32)
 
             # 3. Flux scaling: multiply flux by a factor drawn from [0.95, 1.05].
-            #    Simulates transit depth uncertainty due to dilution from
-            #    nearby stars within TESS's 21-arcsecond pixels.
+            #    Simulates transit depth uncertainty due to dilution or stellar
+            #    variability, normalising for amplitude differences between targets.
             X_batch[i, :, 0] *= np.random.uniform(0.95, 1.05)
 
         return self._split_inputs(X_batch), y_batch
@@ -183,8 +187,22 @@ class AugmentedSequence(Sequence):
 
 
 def split_inputs(X):
-    """Split a full tensor into the two branch inputs without augmentation."""
+    """Split a full tensor into the two combined-model branch inputs without augmentation."""
     return (X, X[:, LOCAL_START:LOCAL_END, 0:1])
+
+
+def split_inputs_flux_only(X):
+    """Split for flux-only ablation: global = ch0 full, local = ch0 central 200 bins."""
+    return (X[:, :, 0:1], X[:, LOCAL_START:LOCAL_END, 0:1])
+
+
+def split_inputs_centroid_only(X):
+    """
+    Split for centroid-only ablation: both branches receive the full centroid sequence
+    (ch1, ch2). No local branch — both global branches see all 1000 bins.
+    """
+    centroid = X[:, :, 1:3]
+    return (centroid, centroid)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -261,7 +279,7 @@ def warmup_schedule(epoch, lr):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — MODEL
+# SECTION 5 — MODEL DEFINITIONS
 # ═════════════════════════════════════════════════════════════════════════════
 
 def build_model():
@@ -341,6 +359,144 @@ def build_model():
     return model
 
 
+def build_model_flux_only():
+    """
+    Flux-only ablation variant of the dual-branch CNN.
+
+    Removes the centroid channels entirely — both branches operate on the flux
+    channel only (ch0). Used to establish the baseline performance achievable
+    from transit morphology alone, with no centroid information.
+
+    Architecture mirrors the combined model exactly, with input channels = 1.
+    """
+    # ── Global branch: full orbit, flux only ────────────────────────────────
+    global_input = keras.Input(shape=(1000, 1), name="global_input")
+
+    x = layers.Conv1D(32, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(global_input)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    x = layers.MaxPooling1D(pool_size=5)(x)
+
+    x = layers.Conv1D(64, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    x = layers.MaxPooling1D(pool_size=5)(x)
+
+    x = layers.Conv1D(128, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    global_out = layers.GlobalAveragePooling1D()(x)            # → (128,)
+
+    # ── Local branch: transit window, flux only ──────────────────────────────
+    local_input = keras.Input(shape=(200, 1), name="local_input")
+
+    y = layers.Conv1D(32, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(local_input)
+    y = layers.BatchNormalization()(y)
+    y = layers.Activation("relu")(y)
+    y = layers.MaxPooling1D(pool_size=4)(y)
+
+    y = layers.Conv1D(64, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(y)
+    y = layers.BatchNormalization()(y)
+    y = layers.Activation("relu")(y)
+    local_out = layers.GlobalAveragePooling1D()(y)             # → (64,)
+
+    # ── Classification head ───────────────────────────────────────────────────
+    combined = layers.Concatenate()([global_out, local_out])   # → (192,)
+
+    z = layers.Dense(128, activation="relu",
+                     kernel_regularizer=regularizers.l2(1e-4))(combined)
+    z = layers.Dropout(0.5)(z)
+    z = layers.Dense(32, activation="relu",
+                     kernel_regularizer=regularizers.l2(1e-4))(z)
+    z = layers.Dropout(0.5)(z)
+    output = layers.Dense(1, activation="sigmoid")(z)
+
+    model = keras.Model(inputs=[global_input, local_input], outputs=output)
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+        loss=focal_loss(gamma=2.0, alpha=0.5, smoothing=0.1),
+        metrics=["accuracy", keras.metrics.AUC(name="auc")]
+    )
+    return model
+
+
+def build_model_centroid_only():
+    """
+    Centroid-only ablation variant of the dual-branch CNN.
+
+    Removes the flux channel entirely — both branches operate on centroid channels
+    (ch1=RA, ch2=Dec). The local branch is omitted (slicing the central 200 bins
+    of a centroid series has no physical transit-morphology interpretation).
+
+    Instead, two global branches process the full 1000-bin centroid sequence:
+      Branch 1 (3 Conv1D blocks, 32→64→128 filters) mirrors the combined global branch.
+      Branch 2 (2 Conv1D blocks, 32→64 filters) mirrors the combined local-branch
+        architecture but on the full sequence rather than a central slice.
+
+    Used to isolate the contribution of centroid information alone, without transit
+    morphology features. Performance degrades with k as centroid SNR decreases.
+    """
+    # ── Branch 1: full centroid sequence, 3-block architecture ──────────────
+    global_input_1 = keras.Input(shape=(1000, 2), name="global_input_1")
+
+    x = layers.Conv1D(32, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(global_input_1)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    x = layers.MaxPooling1D(pool_size=5)(x)
+
+    x = layers.Conv1D(64, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    x = layers.MaxPooling1D(pool_size=5)(x)
+
+    x = layers.Conv1D(128, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    branch1_out = layers.GlobalAveragePooling1D()(x)           # → (128,)
+
+    # ── Branch 2: same centroid sequence, 2-block architecture ──────────────
+    global_input_2 = keras.Input(shape=(1000, 2), name="global_input_2")
+
+    y = layers.Conv1D(32, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(global_input_2)
+    y = layers.BatchNormalization()(y)
+    y = layers.Activation("relu")(y)
+    y = layers.MaxPooling1D(pool_size=4)(y)
+
+    y = layers.Conv1D(64, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(y)
+    y = layers.BatchNormalization()(y)
+    y = layers.Activation("relu")(y)
+    branch2_out = layers.GlobalAveragePooling1D()(y)           # → (64,)
+
+    # ── Classification head ───────────────────────────────────────────────────
+    combined = layers.Concatenate()([branch1_out, branch2_out])  # → (192,)
+
+    z = layers.Dense(128, activation="relu",
+                     kernel_regularizer=regularizers.l2(1e-4))(combined)
+    z = layers.Dropout(0.5)(z)
+    z = layers.Dense(32, activation="relu",
+                     kernel_regularizer=regularizers.l2(1e-4))(z)
+    z = layers.Dropout(0.5)(z)
+    output = layers.Dense(1, activation="sigmoid")(z)
+
+    model = keras.Model(inputs=[global_input_1, global_input_2], outputs=output)
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+        loss=focal_loss(gamma=2.0, alpha=0.5, smoothing=0.1),
+        metrics=["accuracy", keras.metrics.AUC(name="auc")]
+    )
+    return model
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION 6 — TRAINING
 # ═════════════════════════════════════════════════════════════════════════════
@@ -403,12 +559,15 @@ def train_fold(X_train, y_train, X_val, y_val):
 
 def find_best_threshold(y_true, y_prob):
     """
-    Search for the sigmoid threshold that maximises F1-macro on the validation
-    set. The default of 0.5 assumes output probabilities are centred at 0.5,
+    Search for the sigmoid threshold that maximises F1-macro on the given set.
+    The default of 0.5 assumes output probabilities are centred at 0.5,
     which is rarely true — especially when class weights shift the effective
     decision boundary. We search 99 candidates between 0.01 and 0.99 and pick
     the one that maximises F1-macro, treating both classes equally.
-    This search is done entirely on validation data, so no test leakage occurs.
+
+    IMPORTANT: For reported ensemble test metrics, this function is called on
+    out-of-fold (OOF) CV predictions, NOT on test-set predictions. The returned
+    threshold is then applied fixed to the test set, preventing evaluation leakage.
     """
     best_thresh, best_f1 = 0.5, 0.0
     for t in np.linspace(0.01, 0.99, 99):
@@ -420,13 +579,19 @@ def find_best_threshold(y_true, y_prob):
 
 
 def evaluate_fold(model, X_val, y_val):
-    """Compute all metrics for one validation fold with optimised threshold."""
+    """
+    Compute all metrics for one validation fold with optimised threshold.
+
+    Returns:
+        metrics: dict of per-fold metrics
+        y_prob:  raw sigmoid probabilities (for OOF threshold optimisation)
+    """
     y_prob = model.predict(split_inputs(X_val), verbose=0, batch_size=64).flatten()
     best_thresh, _ = find_best_threshold(y_val, y_prob)
     y_pred = (y_prob >= best_thresh).astype(int)
     print(f"    Optimal threshold: {best_thresh:.3f}")
 
-    return {
+    metrics = {
         "threshold":        best_thresh,
         "accuracy":         accuracy_score(y_val, y_pred),
         "f1_planet":        f1_score(y_val, y_pred, pos_label=1, zero_division=0),
@@ -440,6 +605,8 @@ def evaluate_fold(model, X_val, y_val):
         "roc_auc":          roc_auc_score(y_val, y_prob),
         "confusion_matrix": confusion_matrix(y_val, y_pred),
     }
+    # Return y_prob alongside metrics so callers can collect OOF predictions
+    return metrics, y_prob
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -498,9 +665,19 @@ def save_scores(kepid_arr, kepoi_arr, fp_subtype_arr, y_true, y_score, out_path)
     print(f"  Test scores → {out_path}")
 
 
-def save_metrics_report(fold_metrics, ensemble_metrics, n_total, output_path, tag=""):
+def save_metrics_report(fold_metrics, ensemble_metrics, n_total, output_path,
+                        tag="", cv_threshold=None, test_oracle_threshold=None):
     """
     Write a structured text report with per-fold, CV-averaged, and test-set metrics.
+
+    Args:
+        fold_metrics:           list of per-fold metric dicts
+        ensemble_metrics:       dict of ensemble test-set metrics
+        n_total:                total training examples
+        output_path:            output .txt file path
+        tag:                    CSV tag (e.g. 'k3_psf0')
+        cv_threshold:           OOF-derived threshold used for test metrics
+        test_oracle_threshold:  threshold from test-set search (informational only)
     """
     metric_keys = [
         "threshold", "accuracy", "f1_planet", "f1_fp", "f1_macro",
@@ -541,11 +718,17 @@ def save_metrics_report(fold_metrics, ensemble_metrics, n_total, output_path, ta
         f"  True Planet       {cm_avg[1,0]:>8.1f}        {cm_avg[1,1]:>8.1f}",
     ]
 
-    # Add ensemble results section
+    # Ensemble results with clear threshold labelling to prevent misinterpretation
+    oof_thresh_str = (f"{cv_threshold:.3f}" if cv_threshold is not None
+                      else f"{ensemble_metrics.get('threshold', 0.5):.3f}")
+    oracle_thresh_str = (f"{test_oracle_threshold:.3f}"
+                         if test_oracle_threshold is not None else "N/A")
     lines += [
-        "", sep, "5-FOLD ENSEMBLE RESULTS", sep,
+        "", sep,
+        f"ENSEMBLE TEST METRICS (threshold fixed from OOF CV: {oof_thresh_str})",
+        sep,
         "Predictions: Average sigmoid probability from all 5 fold models",
-        f"Threshold: {ensemble_metrics['threshold']:.3f}  (optimised on full dataset)",
+        f"Test-set oracle threshold (informational only, not used): {oracle_thresh_str}",
         "-" * 67,
     ]
     for key in metric_keys:
@@ -569,10 +752,8 @@ def save_metrics_report(fold_metrics, ensemble_metrics, n_total, output_path, ta
         "                  (0.5 = random chance, 1.0 = perfect)",
         "  f1_macro      = unweighted mean of per-class F1",
         "                  (best single summary for balanced classes)",
-        "  threshold     = per-fold optimal sigmoid cut-point (not fixed at 0.5)",
+        "  threshold     = OOF-optimised sigmoid cut-point (not test-set optimised)",
         "  ensemble      = average probability across all 5 fold models",
-        "                  (provides calibration estimate; optimistic since",
-        "                   each model saw 80% of the data during training)",
     ]
 
     report = "\n".join(lines)
@@ -583,11 +764,139 @@ def save_metrics_report(fold_metrics, ensemble_metrics, n_total, output_path, ta
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SECTION 9 — MAIN PIPELINE
+# SECTION 9 — ABLATION STUDY (flux-only and centroid-only variants)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _run_ablation_study(
+    X_cv: np.ndarray,
+    y_cv: np.ndarray,
+    groups_cv: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    kepid_test: np.ndarray,
+    kepoi_test: np.ndarray,
+    fp_subtype_test: np.ndarray,
+    tag: str,
+) -> None:
+    """
+    Train flux-only and centroid-only CNN ablation variants using the same
+    StratifiedGroupKFold splits (same seed) as the primary combined model.
+
+    This is a self-contained, simplified training loop — no OOF threshold
+    optimisation, no full metrics report. It exists solely to produce per-target
+    test scores for the ablation panel of the AUC-vs-resolution figure.
+
+    Code duplication relative to the main combined-model loop is intentional:
+    refactoring the combined loop to share code would risk touching the primary
+    study path, potentially introducing subtle behavioural drift in the most
+    important model. Ablation models are secondary.
+
+    Only runs for psf=0 CSVs (indicated by the caller checking tag.endswith('psf0')).
+
+    Outputs:
+        results_resolution/scores_{tag}_flux_only.csv
+        results_resolution/scores_{tag}_centroid_only.csv
+    """
+    variants = [
+        ("flux_only",     build_model_flux_only,    split_inputs_flux_only,    "[flux-only]"),
+        ("centroid_only", build_model_centroid_only, split_inputs_centroid_only, "[centroid-only]"),
+    ]
+
+    # Use the same fold structure as the combined model (same seed, same data)
+    sgkf = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+
+    for variant_key, model_builder, input_splitter, print_label in variants:
+        print(f"\n  Ablation {print_label} [{tag}] — training {N_FOLDS} folds ...")
+
+        fold_models_ab = []
+
+        for fold_idx, (train_idx, val_idx) in enumerate(
+            sgkf.split(X_cv, y_cv, groups=groups_cv)
+        ):
+            # Leakage check — same guarantee as the combined loop
+            train_kps_ab = set(groups_cv[train_idx])
+            val_kps_ab   = set(groups_cv[val_idx])
+            assert train_kps_ab.isdisjoint(val_kps_ab), \
+                f"Ablation {print_label} fold {fold_idx+1}: kepid leakage"
+
+            model_ab = model_builder()
+
+            # Build augmented sequence with custom input splitter
+            class _AblationSeq(Sequence):
+                """Augmented sequence for ablation with overridden input split."""
+                def __init__(self, X, y, batch_size, shuffle, splitter):
+                    self.X = X; self.y = y; self.batch_size = batch_size
+                    self.shuffle = shuffle; self.splitter = splitter
+                    self.indices = np.arange(len(X)); self.on_epoch_end()
+                def __len__(self): return len(self.X) // self.batch_size
+                def on_epoch_end(self):
+                    if self.shuffle: np.random.shuffle(self.indices)
+                def __getitem__(self, idx):
+                    bidx = self.indices[idx*self.batch_size:(idx+1)*self.batch_size]
+                    Xb = self.X[bidx].copy(); yb = self.y[bidx]
+                    for i in range(len(Xb)):
+                        shift = np.random.randint(-20, 21)
+                        Xb[i] = np.roll(Xb[i], shift, axis=0)
+                        Xb[i, :, 0] += np.random.normal(0, 0.02, NUM_BINS).astype(np.float32)
+                        Xb[i, :, 0] *= np.random.uniform(0.95, 1.05)
+                    return self.splitter(Xb), yb
+
+            train_gen_ab = _AblationSeq(
+                X_cv[train_idx], y_cv[train_idx], BATCH_SIZE,
+                shuffle=True, splitter=input_splitter
+            )
+            val_data_ab = (input_splitter(X_cv[val_idx]), y_cv[val_idx])
+
+            callbacks_ab = [
+                LearningRateScheduler(warmup_schedule, verbose=0),
+                ReduceLROnPlateau(monitor="val_auc", factor=0.5, patience=7,
+                                  mode="max", min_lr=1e-6, verbose=0),
+                EarlyStopping(monitor="val_auc", patience=15, mode="max",
+                              restore_best_weights=True, verbose=0),
+            ]
+
+            history_ab = model_ab.fit(
+                train_gen_ab,
+                validation_data=val_data_ab,
+                epochs=EPOCHS,
+                callbacks=callbacks_ab,
+                class_weight=CLASS_WEIGHT,
+                verbose=0,
+            )
+            best_auc_ab = max(history_ab.history["val_auc"])
+            print(f"    {print_label} Fold {fold_idx+1}: best val AUC = {best_auc_ab:.4f}")
+            fold_models_ab.append(model_ab)
+
+        # Ensemble test scores
+        test_probs_ab = np.zeros(len(X_test))
+        for m_ab in fold_models_ab:
+            test_probs_ab += m_ab.predict(
+                input_splitter(X_test), verbose=0, batch_size=64
+            ).flatten()
+            tf.keras.backend.clear_session()
+        test_probs_ab /= N_FOLDS
+
+        test_auc_ab = roc_auc_score(y_test, test_probs_ab)
+        print(f"  {print_label} [{tag}] Test AUC: {test_auc_ab:.4f}")
+
+        scores_path_ab = os.path.join(OUTPUT_DIR, f"scores_{tag}_{variant_key}.csv")
+        save_scores(kepid_test, kepoi_test, fp_subtype_test,
+                    y_test, test_probs_ab, scores_path_ab)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SECTION 10 — MAIN PIPELINE
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _train_and_eval_one_csv(csv_path: str) -> None:
-    """Train the CNN for one per-k training CSV and save scores + metrics."""
+    """
+    Train the combined dual-branch CNN for one per-k training CSV and save
+    scores + metrics. Also triggers the ablation study for psf=0 CSVs.
+
+    Ensemble threshold is derived from out-of-fold (OOF) CV predictions to
+    prevent evaluation leakage — the test set is never used for threshold
+    selection.
+    """
     # Parse k and psf from filename, e.g. kepler_training_data_k3_psf1.csv
     basename = os.path.basename(csv_path)
     tag = basename.replace("kepler_training_data_", "").replace(".csv", "")
@@ -628,6 +937,10 @@ def _train_and_eval_one_csv(csv_path: str) -> None:
     fold_models  = []
     all_cms      = []
 
+    # Collect OOF predictions for threshold optimisation (Fix 6: prevent leakage)
+    oof_true  = []
+    oof_probs = []
+
     print(f"\nBeginning {N_FOLDS}-fold KIC-grouped CV  [{tag}]")
     print(f"Class weights: {CLASS_WEIGHT}")
     print("-" * 67)
@@ -647,14 +960,26 @@ def _train_and_eval_one_csv(csv_path: str) -> None:
 
         model   = train_fold(X_cv[train_idx], y_cv[train_idx],
                              X_cv[val_idx],   y_cv[val_idx])
-        metrics = evaluate_fold(model, X_cv[val_idx], y_cv[val_idx])
+        # evaluate_fold returns (metrics_dict, y_prob) — y_prob for OOF collection
+        metrics, y_prob_val = evaluate_fold(model, X_cv[val_idx], y_cv[val_idx])
         fold_metrics.append(metrics)
         fold_models.append(model)
         all_cms.append(metrics["confusion_matrix"])
 
+        # Accumulate OOF predictions for post-CV threshold optimisation
+        oof_true.append(y_cv[val_idx])
+        oof_probs.append(y_prob_val)
+
         print(f"    Accuracy: {metrics['accuracy']:.4f}  |  "
               f"AUC-ROC: {metrics['roc_auc']:.4f}  |  "
               f"F1-macro: {metrics['f1_macro']:.4f}")
+
+    # ── OOF threshold (no test-set leakage) ──────────────────────────────────
+    oof_y = np.concatenate(oof_true)
+    oof_p = np.concatenate(oof_probs)
+    # Threshold derived entirely from CV out-of-fold predictions — test set never seen here
+    cv_threshold, _ = find_best_threshold(oof_y, oof_p)
+    print(f"\nOOF threshold (from {len(oof_y)} OOF predictions): {cv_threshold:.3f}")
 
     # ── Ensemble inference on held-out test set ───────────────────────────────
     print(f"\nComputing ensemble scores on held-out test set ({len(X_test)} examples)...")
@@ -675,12 +1000,17 @@ def _train_and_eval_one_csv(csv_path: str) -> None:
     scores_path = os.path.join(OUTPUT_DIR, f"scores_{tag}.csv")
     save_scores(kepid_test, kepoi_test, fp_subtype_test, y_test, test_probs, scores_path)
 
-    # Ensemble metrics on test set (threshold optimised on test set — informational only)
-    test_thresh, _ = find_best_threshold(y_test, test_probs)
-    test_pred = (test_probs >= test_thresh).astype(int)
+    # Apply the OOF-derived threshold to the test set for reported metrics.
+    # This threshold was never optimised on the test set — no leakage.
+    test_pred = (test_probs >= cv_threshold).astype(int)
+
+    # Test-set oracle threshold: found by searching the test set itself.
+    # This is informational ONLY — it shows the ceiling for a "cheating" threshold.
+    # It is NOT used for any reported metric.
+    test_thresh_oracle, _ = find_best_threshold(y_test, test_probs)
 
     ensemble_metrics = {
-        "threshold":        test_thresh,
+        "threshold":        cv_threshold,           # OOF threshold (reported)
         "accuracy":         accuracy_score(y_test, test_pred),
         "f1_planet":        f1_score(y_test, test_pred, pos_label=1, zero_division=0),
         "f1_fp":            f1_score(y_test, test_pred, pos_label=0, zero_division=0),
@@ -705,12 +1035,25 @@ def _train_and_eval_one_csv(csv_path: str) -> None:
         fold_metrics, ensemble_metrics, n_total,
         os.path.join(OUTPUT_DIR, f"metrics_{tag}.txt"),
         tag=tag,
+        cv_threshold=cv_threshold,
+        test_oracle_threshold=test_thresh_oracle,
     )
 
     print(f"\nCV summary [{tag}]:")
     for key in ["accuracy", "roc_auc", "f1_macro", "recall_fp", "recall_planet"]:
         vals = [m[key] for m in fold_metrics]
         print(f"  {key:<22}  {np.mean(vals):.4f} ± {np.std(vals):.4f}")
+
+    # ── Ablation study (psf=0 CSVs only) ─────────────────────────────────────
+    # The ablation is a secondary analysis; only run for the rebinning-only
+    # (psf=0) result set to avoid 2x the compute with minimal additional insight.
+    if tag.endswith("psf0"):
+        print(f"\n  Running ablation study for {tag} ...")
+        _run_ablation_study(
+            X_cv, y_cv, groups_cv,
+            X_test, y_test, kepid_test, kepoi_test, fp_subtype_test,
+            tag,
+        )
 
 
 def main():

@@ -5,8 +5,12 @@ Reads pre-computed results from results_resolution/ and produces:
   - results_resolution/comparison.csv  — one row per (k, psf) with all AUCs + CI
   - results_resolution/report.md       — human-readable study summary
   - results_resolution/figures/
-        fig1_auc_vs_k.png              — AUC vs. pixel scale (CNN + Bryson [+ vetting])
         fig3_difference_images.png     — example diff images at k=1..5
+
+Note: fig1 (AUC vs. pixel scale) has been retired from this module.
+AUC plots are now produced by graphs.py, which also generates the ablation
+and threshold-crossing figures. Running `python graphs.py` after compare.py
+produces all AUC figures in results_resolution/graphs/.
 
 Never re-runs expensive compute. All inputs are read from CSV/cache.
 """
@@ -59,75 +63,6 @@ def build_comparison_csv(results_dir: str) -> pd.DataFrame:
 
 
 # ============================================================================
-# Figure 1: AUC vs. pixel scale
-# ============================================================================
-
-def plot_auc_vs_k(df: pd.DataFrame, out_path: str) -> None:
-    """
-    Figure 1: AUC vs. effective pixel scale for CNN and Bryson (+ vetting if present).
-    Shaded 95% CI bands. PSF off = solid lines, PSF on = dashed.
-    x-axis in arcsec (3.98·k).
-    """
-    if df.empty:
-        print("WARNING: No data for Figure 1 — skipping.")
-        return
-
-    method_styles = {
-        "CNN":     {"color": "#4878cf", "marker": "o", "label_base": "CNN"},
-        "Bryson":  {"color": "#e07b54", "marker": "s", "label_base": "Bryson (2013)"},
-        "vetting": {"color": "#6acc65", "marker": "^", "label_base": "vetting (Hedges 2021)"},
-    }
-    psf_linestyles = {0: "-", 1: "--"}
-
-    fig, ax = plt.subplots(figsize=(9, 6))
-
-    for psf_val in sorted(df["psf"].unique()):
-        sub = df[df["psf"] == psf_val].sort_values("k")
-        x = sub["effective_scale_arcsec"].values
-        ls = psf_linestyles[psf_val]
-        psf_label = " (PSF on)" if psf_val == 1 else ""
-
-        for method, col_auc, col_lo, col_hi in [
-            ("CNN",     "cnn_auc",     "cnn_ci_lo",     "cnn_ci_hi"),
-            ("Bryson",  "bryson_auc",  "bryson_ci_lo",  "bryson_ci_hi"),
-            ("vetting", "vetting_auc", "vetting_ci_lo", "vetting_ci_hi"),
-        ]:
-            if col_auc not in sub.columns or sub[col_auc].isna().all():
-                continue
-            y    = sub[col_auc].values
-            y_lo = sub[col_lo].values if col_lo in sub.columns else np.full_like(y, np.nan)
-            y_hi = sub[col_hi].values if col_hi in sub.columns else np.full_like(y, np.nan)
-
-            valid = ~np.isnan(y)
-            if not valid.any():
-                continue
-
-            sty = method_styles[method]
-            label = f"{sty['label_base']}{psf_label}"
-            ax.plot(x[valid], y[valid], color=sty["color"], linestyle=ls,
-                    marker=sty["marker"], label=label, linewidth=1.8, markersize=6)
-            if not np.isnan(y_lo[valid]).all():
-                ax.fill_between(x[valid], y_lo[valid], y_hi[valid],
-                                color=sty["color"], alpha=0.15)
-
-    ax.axhline(0.5, color="gray", linestyle=":", linewidth=1, label="Random (AUC=0.5)")
-    ax.set_xlabel("Effective pixel scale (arcsec/pixel)", fontsize=12)
-    ax.set_ylabel("ROC-AUC", fontsize=12)
-    ax.set_ylim(0.4, 1.0)
-    ax.set_title(
-        "Classification performance vs. spatial sampling\n"
-        "(Solid = PSF off, Dashed = PSF on; shaded = 95% CI)",
-        fontsize=12,
-    )
-    ax.legend(fontsize=9, loc="lower left")
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"Figure 1 written to {out_path}")
-
-
-# ============================================================================
 # Figure 3: example difference images
 # ============================================================================
 
@@ -143,7 +78,6 @@ def plot_difference_images(
     Requires degrade.py and cached TPFs. Skips gracefully if unavailable.
     """
     try:
-        import lightkurve as lk
         from degrade import load_cube, superpixel_rebin, difference_image_centroid
     except ImportError as e:
         print(f"  Figure 3: skipping — {e}")
@@ -174,15 +108,18 @@ def plot_difference_images(
         dur_days = float(row_data["koi_duration"]) / 24.0
 
         try:
-            search = lk.search_targetpixelfile(
-                f"KIC {kepid}", mission="Kepler", cadence="long"
-            )
-            if len(search) == 0:
-                raise ValueError("No TPFs found")
-            tpf = search[0].download(quality_bitmask="default", download_dir=tpf_dir)
+            # Load TPF from local disk — no MAST re-query during compare.py.
+            # load_local_tpfs scans tpf_dir recursively for kplr{KIC9}*_lpd-targ.fits*,
+            # excluding macOS AppleDouble sidecar files (._-prefixed).
+            # max_quarters=1 is sufficient for a single difference-image example.
+            from getInputData import load_local_tpfs
+            tpf_list = load_local_tpfs(kepid, tpf_dir, max_quarters=1)
+            if not tpf_list:
+                raise ValueError(f"No local TPF files found under {tpf_dir}")
+            tpf = tpf_list[0]
             cube, time_tpf, _, _, aperture = load_cube(tpf)
             if cube is None:
-                raise ValueError("Could not load cube")
+                raise ValueError("Could not load cube from local TPF")
         except Exception as exc:
             print(f"  Figure 3: KIC {kepid} ({label_name}): {exc}")
             for col_idx in range(len(k_values)):
@@ -447,10 +384,8 @@ def main():
     # Build comparison.csv
     df = build_comparison_csv(args.results_dir)
 
-    # Figure 1: AUC vs. k
-    plot_auc_vs_k(df, os.path.join(FIGURES_DIR, "fig1_auc_vs_k.png"))
-
     # Figure 3: difference images
+    # (Figure 1 has been retired; AUC plots are produced by graphs.py)
     if not args.no_fig3 and not manifest.empty:
         plot_difference_images(
             args.cache_dir, manifest, args.tpf_dir, args.k_values,
@@ -463,9 +398,9 @@ def main():
     print(f"\nAll outputs written to {args.results_dir}/")
     print("  comparison.csv")
     print("  report.md")
-    print("  figures/fig1_auc_vs_k.png")
     print("  figures/fig2_centroid_quality.png  (produced by centroid_quality.py)")
     print("  figures/fig3_difference_images.png")
+    print("\nNext step: python graphs.py  (AUC plots, ablation, threshold-crossing figures)")
 
 
 if __name__ == "__main__":
