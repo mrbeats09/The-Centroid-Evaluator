@@ -1,21 +1,34 @@
 """
 getInputData.py — Kepler TPF Loading and Preprocessing Pipeline
 
-Reads koi_manifest.csv, loads Kepler long-cadence Target Pixel Files (TPFs) from
-the local filesystem (no MAST re-query during cache build), and orchestrates the
-degradation + preprocessing pipeline to produce per-k training CSVs.
+Reads koi_manifest.csv, loads Kepler long-cadence Target Pixel Files (TPFs) and
+light-curve (LC) files from the local filesystem (no MAST re-query during cache
+build), and orchestrates the degradation + preprocessing pipeline to produce per-k
+training CSVs.
 
 The pipeline has four modes:
-  (default)         Download TPFs → build degraded cache → write training CSVs
-  --phase download  Download TPFs only (skip cache build and CSV writing)
-  --phase cache     Build degraded cache from existing local TPFs (skip download + CSV)
+  (default)         Download TPFs + LCs → build degraded cache → write training CSVs
+  --phase download  Download TPFs + LCs only (skip cache build and CSV writing)
+  --phase cache     Build degraded cache from existing local files (skip download + CSV)
   --phase csv-only  Write training CSVs from existing cache (no FITS access)
+
+Preprocessing improvements over the prior version:
+  - PDC-SAP flux from LC files (replaces SAP from TPFs) to remove instrumental
+    systematics (thermal drifts, attitude tweaks, focus changes).
+  - Per-quarter Savitzky-Golay detrending to remove stellar variability and
+    residual quarter-level trends that survive PDC.
+  - Multi-planet masking: cadences contaminated by other KOIs on the same star
+    are excluded before phase-folding and OOT normalisation.
+  - Global bins reduced from 1000 to 301 (AstroNet convention).
+  - Adaptive local view (61 bins, ±2×transit_duration in phase) stored per KOI.
 
 Cache hierarchy (all gitignored):
   tpf_temp/                                  raw FITS (lightkurve managed)
   cache/flux/{kepoi_name}.npz                native-res folded flux per KOI
   cache/cubes/{kepid}_q{Q}_k{K}_psf{P}.npz  degraded pixel cubes
   cache/centroids/{kepid}_k{K}_psf{P}.npz   centroid time series + quality metrics
+  cache/search/{kepid}.pkl                   TPF MAST search result cache
+  cache/search/lc_{kepid}.pkl                LC MAST search result cache
 
 Note on cache-key design:
   Flux cache is keyed by kepoi_name (e.g. K00001.01) because each KOI has its own
@@ -28,6 +41,12 @@ Note on cache-key design:
   (acknowledged limitation; centroid is per-star not per-planet).
 
 Output: kepler_training_data_k{K}_psf{0|1}.csv  (one per degradation level + PSF setting)
+Output schema (971 columns per row):
+  7 metadata: kepid, kepoi_name, label, fp_subtype, koi_period, koi_time0bk, koi_duration
+  f_0..f_300   (301 global flux bins — OOT-normalised, OOT-standardised)
+  m1_0..m1_300 (301 global RA centroid bins at scale k)
+  m2_0..m2_300 (301 global Dec centroid bins at scale k)
+  l_0..l_60    (61 adaptive local flux bins, ±2×transit_duration in phase)
 
 BKJD epoch note: koi_time0bk is already in BKJD (BJD − 2454833.0). Used directly.
 Do NOT subtract 2457000 (that is the TESS BTJD offset).
@@ -44,13 +63,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
+from scipy.signal import savgol_filter
 from scipy.stats import binned_statistic
 from tqdm import tqdm
 
 import lightkurve as lk
 
 # Training CSV parameters
-NUM_BINS = 1000
+NUM_BINS = 301   # was 1000; matches AstroNet global view bin count
+LOCAL_BINS = 61  # adaptive local view bins (per _extract_local_bins)
 SPARSITY_THRESHOLD = 0.30  # discard if > 30% empty bins (relaxed for long cadence)
 
 # Default degradation levels; matches plan k=[1,2,3,4,5]
@@ -77,7 +98,7 @@ def log_failure(path: str, msg: str) -> None:
 
 
 # ============================================================================
-# Local TPF loader (Fix 1) — replaces the MAST re-query in _load_tpfs
+# Local TPF loader — no MAST re-query during cache build
 # ============================================================================
 
 def load_local_tpfs(kepid: int, tpf_dir: str, max_quarters: int | None) -> list:
@@ -148,6 +169,76 @@ def load_local_tpfs(kepid: int, tpf_dir: str, max_quarters: int | None) -> list:
 
 
 # ============================================================================
+# Local LC loader — PDC-SAP source; sibling of load_local_tpfs
+# ============================================================================
+
+def load_local_lcs(kepid: int, tpf_dir: str, max_quarters: int | None) -> list:
+    """
+    Scan tpf_dir recursively for Kepler long-cadence light-curve FITS files
+    matching this kepid. Returns a list of KeplerLightCurve objects loaded via
+    lk.read(), sorted by filename (chronological quarter order), capped at
+    max_quarters if set. macOS ._-prefixed sidecars are excluded.
+
+    LC files follow the naming pattern: kplr{kepid:09d}*_llc.fits*
+    (as opposed to TPF files which match *_lpd-targ.fits*).
+
+    This function does NOT contact MAST or any network resource. If no files are
+    found, a warning is logged to failed_targets.log (prefix LC_LOAD:) and []
+    is returned.
+
+    PDC-SAP flux is the default when loading Kepler LC files via lk.read().
+    The flux column accessed via lc.flux.value returns PDC-SAP.
+
+    Args:
+        kepid:        KIC target identifier (integer)
+        tpf_dir:      root directory to scan recursively
+        max_quarters: cap on number of LC files to load; None = all found
+
+    Returns:
+        List of lightkurve LightCurve objects (possibly empty).
+    """
+    kic_str = f"kplr{kepid:09d}"
+    fits_files = []
+
+    for root, _dirs, files in os.walk(tpf_dir):
+        for fname in files:
+            # Exclude macOS AppleDouble sidecar files
+            if fname.startswith("._"):
+                continue
+            # Match Kepler long-cadence LC pattern:
+            # e.g. kplr009757613-2009259160929_llc.fits.gz
+            if kic_str in fname and "_llc.fits" in fname:
+                fits_files.append(os.path.join(root, fname))
+
+    if not fits_files:
+        log_failure(
+            "failed_targets.log",
+            f"LC_LOAD: KIC {kepid}: no local LC FITS files found under {tpf_dir}",
+        )
+        return []
+
+    # Sort by filename — timestamp in name gives chronological (quarter) order
+    fits_files.sort()
+
+    if max_quarters is not None:
+        fits_files = fits_files[:max_quarters]
+
+    lc_list = []
+    for path in fits_files:
+        try:
+            lc = lk.read(path)
+            lc_list.append(lc)
+        except Exception as exc:
+            log_failure(
+                "failed_targets.log",
+                f"LC_LOAD: KIC {kepid}: could not read {os.path.basename(path)}: "
+                f"{type(exc).__name__}: {exc}",
+            )
+
+    return lc_list
+
+
+# ============================================================================
 # Phase 1: TPF download
 # ============================================================================
 
@@ -174,6 +265,11 @@ def enable_cloud_storage() -> bool:
 
 def _search_cache_path(cache_dir: str, kepid: int) -> str:
     return os.path.join(cache_dir, "search", f"{kepid}.pkl")
+
+
+def _lc_search_cache_path(cache_dir: str, kepid: int) -> str:
+    """LC search cache path — uses lc_ prefix to distinguish from TPF cache."""
+    return os.path.join(cache_dir, "search", f"lc_{kepid}.pkl")
 
 
 def _load_cached_search(cache_dir: str, kepid: int):
@@ -240,8 +336,8 @@ def _search_with_retry(
     max_retries: int = 5,
 ) -> tuple:
     """
-    Query the MAST search API for one kepid, respecting the rate limiter and
-    retrying on transient failures (429, connection errors) with exponential backoff.
+    Query the MAST search API for one kepid (TPF), respecting the rate limiter
+    and retrying on transient failures with exponential backoff.
     Returns a lightkurve SearchResult, or None if the target has no data.
     Raises on permanent failure after max_retries attempts.
     """
@@ -265,6 +361,36 @@ def _search_with_retry(
     return None
 
 
+def _search_lc_with_retry(
+    kepid: int,
+    rate_limiter: _MastRateLimiter,
+    max_retries: int = 5,
+):
+    """
+    Query MAST for Kepler long-cadence light-curve files for one kepid.
+    Sibling of _search_with_retry; calls search_lightcurve instead of
+    search_targetpixelfile. All available quarters are returned — no
+    max_quarters cap on LC downloads (LC and TPF quarter counts may differ;
+    using all LC quarters maximises the PDC-SAP baseline coverage).
+    Retries transient failures with exponential backoff.
+    """
+    for attempt in range(max_retries):
+        try:
+            with rate_limiter:
+                result = lk.search_lightcurve(
+                    f"KIC {kepid}", mission="Kepler", cadence="long"
+                )
+            if len(result) == 0:
+                return None
+            return result  # All quarters — no cap applied
+        except Exception as exc:
+            if attempt == max_retries - 1:
+                raise
+            backoff = 2 ** (attempt + 1)
+            time.sleep(backoff)
+    return None
+
+
 def _download_with_retry(
     kepid: int,
     search_result,
@@ -283,6 +409,30 @@ def _download_with_retry(
                 quality_bitmask="default",
                 download_dir=tpf_dir,
             )
+            return kepid, True, ""
+        except Exception as exc:
+            if attempt == max_retries - 1:
+                return kepid, False, f"{type(exc).__name__}: {exc}"
+            time.sleep(2 ** (attempt + 1))
+    return kepid, False, "exceeded max retries"
+
+
+def _download_lc_with_retry(
+    kepid: int,
+    search_result,
+    tpf_dir: str,
+    max_retries: int = 4,
+) -> tuple[int, bool, str]:
+    """
+    Download LC files for one kepid given a pre-fetched SearchResult.
+    Sibling of _download_with_retry; downloads into the same tpf_dir tree.
+    Lightkurve places LC files under {tpf_dir}/mastDownload/Kepler/kplr.../
+    alongside any existing TPF files.
+    Returns (kepid, success, error_message).
+    """
+    for attempt in range(max_retries):
+        try:
+            search_result.download_all(download_dir=tpf_dir)
             return kepid, True, ""
         except Exception as exc:
             if attempt == max_retries - 1:
@@ -385,7 +535,314 @@ def download_tpfs(
                         log_failure("failed_targets.log", f"KIC {kepid}: {err}")
                 pbar.update(1)
 
-    print(f"Phase 1 complete: {success:,} downloaded, {failed:,} failed.")
+    tqdm.write(f"Phase 1 complete: {success:,} downloaded, {failed:,} failed.")
+
+
+def download_lcs(
+    manifest: pd.DataFrame,
+    tpf_dir: str,
+    cache_dir: str,
+    n_workers: int = 8,
+    search_rate: float = 3.0,
+) -> None:
+    """
+    Download Kepler long-cadence light-curve (LLC) FITS files for each unique
+    kepid in the manifest. Mirrors download_tpfs with two differences:
+
+      - Uses lk.search_lightcurve (not search_targetpixelfile).
+      - Downloads ALL available quarters regardless of --max-quarters, so that
+        PDC-SAP flux covers the full mission baseline for each target (TPF and LC
+        quarter counts may differ; capping LC quarters could produce a shorter flux
+        baseline than the centroid time series built from TPFs).
+      - LC search results are cached to cache/search/lc_{kepid}.pkl (prefix
+        distinguishes them from the TPF search cache {kepid}.pkl).
+      - Download failures are logged to failed_targets.log with prefix LC:.
+
+    Two-phase design (same as download_tpfs):
+      Phase 1c-a — MAST search (rate-limited, resumable via disk cache)
+      Phase 1c-b — Parallel downloads (retry on error)
+
+    Lightkurve places LC files under {tpf_dir}/mastDownload/Kepler/kplr{KIC:09d}_lc_Q*/
+    interleaved with TPF files in the same directory tree.
+    """
+    os.makedirs(tpf_dir, exist_ok=True)
+    os.makedirs(os.path.join(cache_dir, "search"), exist_ok=True)
+    unique_kepids = manifest["kepid"].unique()
+
+    # ── Phase 1c-a: MAST search for LC files ────────────────────────────────
+
+    cached_results: dict[int, object] = {}
+    to_query: list[int] = []
+
+    for kepid in unique_kepids:
+        path = _lc_search_cache_path(cache_dir, kepid)
+        if not os.path.exists(path):
+            to_query.append(kepid)
+        else:
+            try:
+                with open(path, "rb") as fh:
+                    hit = pickle.load(fh)
+                if hit is not None:
+                    cached_results[kepid] = hit
+                # hit is None → confirmed no LC data; skip silently
+            except Exception:
+                to_query.append(kepid)  # corrupt cache: re-query
+
+    print(f"\nPhase 1c-a: Querying MAST for {len(unique_kepids):,} LC targets "
+          f"(rate-limited to {search_rate:.0f} req/s, all quarters) ...")
+    if cached_results:
+        print(f"  ↳ {len(unique_kepids) - len(to_query):,} already cached — "
+              f"querying {len(to_query):,} new targets.")
+
+    rate_limiter = _MastRateLimiter(calls_per_second=search_rate)
+    search_results: dict[int, object] = dict(cached_results)
+    search_failed: list[str] = []
+
+    for kepid in tqdm(to_query, desc="MAST LC search", unit="target"):
+        try:
+            result = _search_lc_with_retry(kepid, rate_limiter)
+            # Cache immediately (None = confirmed no LC data for this target)
+            path = _lc_search_cache_path(cache_dir, kepid)
+            try:
+                with open(path, "wb") as fh:
+                    pickle.dump(result, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            except Exception:
+                pass  # non-fatal: re-query on next run
+            if result is None:
+                search_failed.append(f"LC: KIC {kepid}: No Kepler long-cadence LCs found")
+            else:
+                search_results[kepid] = result
+        except Exception as exc:
+            # Do not cache failures — allow retry on next run
+            search_failed.append(
+                f"LC: KIC {kepid}: search failed: {type(exc).__name__}: {exc}"
+            )
+
+    for msg in search_failed:
+        log_failure("failed_targets.log", msg)
+
+    print(f"Phase 1c-a complete: {len(search_results):,} targets found, "
+          f"{len(search_failed):,} not found / failed.")
+
+    if not search_results:
+        print("No LC targets to download.")
+        return
+
+    # ── Phase 1c-b: Parallel LC downloads ────────────────────────────────────
+    print(f"\nPhase 1c-b: Downloading LC files ({n_workers} concurrent workers) ...")
+    success = failed = 0
+    lock = threading.Lock()
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = {
+            executor.submit(_download_lc_with_retry, kepid, sr, tpf_dir): kepid
+            for kepid, sr in search_results.items()
+        }
+        with tqdm(total=len(search_results), desc="LC downloads", unit="target") as pbar:
+            for future in as_completed(futures):
+                kepid, ok, err = future.result()
+                with lock:
+                    if ok:
+                        success += 1
+                    else:
+                        failed += 1
+                        log_failure("failed_targets.log", f"LC: KIC {kepid}: {err}")
+                pbar.update(1)
+
+    tqdm.write(f"Phase 1c complete: {success:,} LC targets downloaded, {failed:,} failed.")
+
+
+# ============================================================================
+# Preprocessing helpers: SG detrending, transit masking, local bin extraction
+# ============================================================================
+
+def _sg_detrend(flux: np.ndarray, transit_duration_cadences: float,
+                poly_order: int = 3) -> np.ndarray:
+    """
+    Remove stellar variability and instrumental trends from a single-quarter
+    flux array using a Savitzky-Golay filter.
+
+    The filter estimates a smooth, slowly-varying baseline (stellar rotation,
+    spot modulation, quarter-level instrumental drifts). Dividing by this
+    baseline flattens the light curve while preserving sharp transit signals,
+    because transits are much shorter than the filter window and are therefore
+    not absorbed into the polynomial fit. SG filtering is applied even when
+    PDC-SAP flux is available, because quarter-level residual trends survive
+    PDC processing for magnetically active stars.
+
+    Window length = max(31, next_odd(3 * transit_duration_cadences)),
+    clamped to at most len(flux) // 4 (to prevent over-smoothing on short
+    quarters). Window is always rounded to an odd integer.
+
+    Args:
+        flux: 1-D float array, one Kepler quarter, already median-normalised.
+        transit_duration_cadences: transit duration in units of long cadences
+            (29.4 min each). Derived as (koi_duration_hours / 24) / (29.4/1440).
+        poly_order: SG polynomial order (default 3).
+
+    Returns:
+        flux_detrended: flux divided by the SG baseline. NaN-safe: NaNs in the
+        input are linearly interpolated before filtering, then restored after
+        division. If the detrended result contains non-finite values, or if the
+        SG filter raises ValueError, returns the original flux unchanged with a
+        logged warning (prefix SG_WARN:).
+    """
+    if len(flux) < max(31, poly_order + 2):
+        # Quarter too short to detrend meaningfully — return unchanged
+        return flux
+
+    # Compute window length (always odd)
+    raw_window = int(round(3.0 * transit_duration_cadences))
+    # next_odd: return n if already odd, else n+1
+    window = raw_window if raw_window % 2 == 1 else raw_window + 1
+    window = max(31, window)
+    # Clamp to at most len(flux)//4; bitwise OR 1 ensures result stays odd
+    max_window = (len(flux) // 4) | 1
+    window = min(window, max_window)
+
+    # SG requirement: window must exceed poly_order
+    if window <= poly_order:
+        return flux
+
+    # NaN-safe: interpolate gaps before filtering, restore NaN positions afterwards
+    nan_pos = np.isnan(flux)
+    flux_work = flux.copy()
+    if nan_pos.any() and (~nan_pos).sum() >= 2:
+        x = np.arange(len(flux_work))
+        flux_work[nan_pos] = np.interp(x[nan_pos], x[~nan_pos], flux_work[~nan_pos])
+
+    try:
+        baseline = savgol_filter(flux_work, window_length=window, polyorder=poly_order)
+    except ValueError as exc:
+        log_failure(
+            "failed_targets.log",
+            f"SG_WARN: savgol_filter failed (window={window}, n={len(flux)}): "
+            f"{type(exc).__name__}: {exc}",
+        )
+        return flux
+
+    # Guard against near-zero baseline (prevents division blowup on flat/zeroed cadences)
+    baseline = np.where(np.abs(baseline) < 1e-10, 1.0, baseline)
+    detrended = flux_work / baseline
+
+    # Restore original NaN positions
+    detrended[nan_pos] = np.nan
+
+    # Sanity check: non-finite output means SG produced a bad baseline
+    if not np.all(np.isfinite(detrended[~nan_pos])):
+        log_failure(
+            "failed_targets.log",
+            f"SG_WARN: non-finite values after SG detrend (window={window}, "
+            f"n={len(flux)}); using original quarter unchanged",
+        )
+        return flux
+
+    return detrended
+
+
+def _compute_transit_mask(time_arr: np.ndarray,
+                          other_koi_rows: pd.DataFrame) -> np.ndarray:
+    """
+    Compute a boolean mask (True = cadence is free of other planets' transits)
+    over time_arr, given a DataFrame of other KOIs sharing this star.
+
+    Multi-planet masking ensures that when phase-folding on planet X's period,
+    the OOT baseline and centroid OOT statistics are not contaminated by transits
+    of planets Y, Z, ... on the same star.
+
+    For each other KOI, all transit mid-times within [time_arr.min(), time_arr.max()]
+    are computed from koi_period and koi_time0bk (BKJD — used directly; do NOT
+    subtract 2457000, that is the TESS BTJD offset):
+        t_transit = koi_time0bk + n * koi_period  for integer n
+
+    Any cadence within ±1 × (koi_duration / 24) days of a transit mid-time is
+    masked (set False). Using one full transit-duration as the guard band on each
+    side protects the OOT baseline from ingress/egress wing contamination.
+
+    Cadences already NaN in time_arr are set False regardless.
+
+    Args:
+        time_arr:       BKJD timestamps for this target's full time series.
+        other_koi_rows: rows from koi_manifest for OTHER KOIs on the same star.
+
+    Returns:
+        clean_mask: bool array, same length as time_arr.
+            True  = cadence is not contaminated by any other planet's transit.
+            False = cadence falls within ±1×dur of another planet's transit, or is NaN.
+    """
+    # NaN timestamps are always excluded from the clean set
+    clean_mask = ~np.isnan(time_arr)
+
+    if len(other_koi_rows) == 0:
+        return clean_mask
+
+    t_min = float(np.nanmin(time_arr))
+    t_max = float(np.nanmax(time_arr))
+
+    for _, koi_row in other_koi_rows.iterrows():
+        try:
+            period = float(koi_row["koi_period"])
+            t0 = float(koi_row["koi_time0bk"])   # BKJD — use directly
+            dur_h = float(koi_row["koi_duration"])
+        except (KeyError, TypeError, ValueError):
+            continue  # skip rows with missing/uncastable values
+
+        if not (np.isfinite(period) and period > 0
+                and np.isfinite(t0) and np.isfinite(dur_h) and dur_h > 0):
+            continue
+
+        # Guard band = ±1 × transit_duration each side (in days)
+        half_mask = dur_h / 24.0
+
+        # Enumerate integer transit indices spanning the observation window
+        n_start = int(np.ceil((t_min - t0) / period))
+        n_end = int(np.floor((t_max - t0) / period))
+
+        for n in range(n_start, n_end + 1):
+            t_transit = t0 + n * period
+            # Mask cadences within ±half_mask of this transit mid-time
+            clean_mask &= ~(np.abs(time_arr - t_transit) <= half_mask)
+
+    return clean_mask
+
+
+def _extract_local_bins(flux_binned: np.ndarray,
+                        bin_centres: np.ndarray,
+                        dur_days: float,
+                        period: float,
+                        local_bins: int = 61) -> np.ndarray:
+    """
+    Extract and resample an adaptive transit-centred local view from the global
+    phase-folded flux array.
+
+    Window in phase space: [-2*(dur_days/period), +2*(dur_days/period)],
+    clamped to [-0.5, 0.5]. This ensures the transit always fills the local view
+    proportionally regardless of period or duration, matching AstroNet's approach
+    of sizing the local view to 2× the transit duration on each side.
+
+    The global phase-folded array (NUM_BINS bins) is resampled onto a uniform
+    grid of `local_bins` points within the window using np.interp (linear
+    interpolation). This gives a fixed-size (local_bins,) array regardless of the
+    target's orbital parameters.
+
+    Global bins (NUM_BINS=301) feed the global CNN branch. Local bins (61) are an
+    adaptive per-target resample centred on the transit, stored pre-computed in
+    l_0..l_60 CSV columns to avoid runtime re-interpolation during training.
+
+    Args:
+        flux_binned:  (NUM_BINS,) phase-folded, normalised flux.
+        bin_centres:  (NUM_BINS,) phase values corresponding to flux_binned.
+        dur_days:     transit duration in days (koi_duration_hours / 24).
+        period:       orbital period in days.
+        local_bins:   number of output bins (default 61, matching AstroNet local).
+
+    Returns:
+        local_flux: (local_bins,) float array of the resampled local view.
+    """
+    half_window = min(0.5, 2.0 * dur_days / period)
+    local_phase = np.linspace(-half_window, half_window, local_bins)
+    local_flux = np.interp(local_phase, bin_centres, flux_binned)
+    return local_flux
 
 
 # ============================================================================
@@ -409,6 +866,10 @@ def build_cache(
     Centroids are per-KIC star (moment centroids are a property of the aperture,
     not the individual transit; difference-image centroid uses the first KOI's
     ephemeris as a representative proxy).
+
+    Stale-cache detection: if existing flux cache files were built with the old
+    NUM_BINS (1000-bin schema), this function emits a clear error and exits. The
+    user must manually delete cache/flux/ and cache/centroids/ before re-running.
     """
     try:
         from degrade import (
@@ -428,6 +889,25 @@ def build_cache(
     centroid_dir = os.path.join(cache_dir, "centroids")
     os.makedirs(flux_dir, exist_ok=True)
     os.makedirs(centroid_dir, exist_ok=True)
+
+    # ── Stale-cache guard ────────────────────────────────────────────────────
+    # Detect if existing flux cache was built with a different NUM_BINS.
+    # A schema mismatch causes silently wrong tensor shapes in theModel.py.
+    npz_candidates = [f for f in os.listdir(flux_dir) if f.endswith(".npz")]
+    if npz_candidates:
+        try:
+            probe = np.load(os.path.join(flux_dir, npz_candidates[0]))
+            stored_bins = probe["flux_binned"].shape[0]
+            if stored_bins != NUM_BINS:
+                print(
+                    f"\nWARNING: Stale flux cache detected "
+                    f"(built with {stored_bins} bins; current NUM_BINS={NUM_BINS}).\n"
+                    f"Delete cache/flux/ and cache/centroids/ before proceeding, "
+                    f"then re-run --phase cache."
+                )
+                sys.exit(1)
+        except Exception:
+            pass  # Unreadable probe: proceed; corrupt cache will surface later
 
     unique_kepids = manifest["kepid"].unique()
     koi_by_kepid = manifest.groupby("kepid")
@@ -492,10 +972,11 @@ def build_cache(
 
             # Flux cache: one file per KOI, using that KOI's own ephemeris.
             # A star with two planets gets two separate folded flux series.
+            # koi_rows (= rows) is passed for multi-planet masking.
             for _, row in rows.iterrows():
                 flux_path = os.path.join(flux_dir, f"{row['kepoi_name']}.npz")
                 if not os.path.exists(flux_path):
-                    _compute_flux_cache(row, tpf_list, flux_path)
+                    _compute_flux_cache(row, tpf_list, flux_path, tpf_dir, rows)
 
             # Centroid cache: one file per (kepid, k, psf). Centroids are per-star.
             for k in k_values:
@@ -529,13 +1010,33 @@ def _load_tpfs(kepid: int, tpf_dir: str, max_quarters: int | None) -> list:
     return load_local_tpfs(kepid, tpf_dir, max_quarters)
 
 
-def _compute_flux_cache(row: pd.Series, tpf_list: list, out_path: str) -> None:
+def _compute_flux_cache(row: pd.Series, tpf_list: list, out_path: str,
+                        tpf_dir: str, koi_rows: pd.DataFrame) -> None:
     """
     Compute native-resolution phase-folded, binned flux for one KOI.
 
     Uses this KOI's own ephemeris (period, t0, duration) to fold the light curve.
-    This is correct: two KOIs on the same star have different transit times and
-    periods, so each needs its own phase-folded representation.
+    Two KOIs on the same star have different transit times and periods, so each
+    needs its own phase-folded representation.
+
+    PDC-SAP flux is used when available (from LC FITS files) in preference to SAP
+    flux from TPFs, because PDC removes instrumental systematics (thermal drifts,
+    attitude tweaks, focus changes) that would otherwise alias into the phase-folded
+    light curve as structured noise.
+
+    Fallback chain:
+      1. PDC-SAP from local LC FITS files (kplr*_llc.fits*) — lc.flux.value is
+         PDC-SAP by default for Kepler LC files loaded via lightkurve.
+      2. If pdcsap_flux is all-NaN for a quarter → sap_flux from that LC file.
+      3. If no LC files found → SAP from tpf.to_lightcurve("pipeline").
+
+    Savitzky-Golay detrending (per quarter, after median normalisation) removes
+    stellar variability and quarter-level instrumental trends that survive PDC
+    processing for magnetically active stars.
+
+    Multi-planet masking is applied after concatenating all quarters (before
+    phase-folding) to exclude cadences contaminated by other KOIs' transits.
+    This prevents OOT-baseline contamination for multi-planet systems.
 
     Writes cache/flux/{kepoi_name}.npz with arrays: flux_binned, bin_centres.
 
@@ -543,33 +1044,110 @@ def _compute_flux_cache(row: pd.Series, tpf_list: list, out_path: str) -> None:
     Do NOT subtract 2457000 (that is the TESS BTJD offset).
 
     Args:
-        row:      single KOI row from the manifest (period, t0, duration, kepoid_name)
+        row:      single KOI row from the manifest (period, t0, duration, kepoi_name)
         tpf_list: list of TPF objects for the parent KIC star
         out_path: destination path for the .npz output
+        tpf_dir:  root TPF/LC directory, passed to load_local_lcs
+        koi_rows: all KOI rows for this star (used for multi-planet masking)
     """
     kepid = int(row["kepid"])
     period = float(row["koi_period"])
     # koi_time0bk is BKJD — use directly; do NOT subtract 2457000 (TESS offset)
     t0_bkjd = float(row["koi_time0bk"])
     dur_days = float(row["koi_duration"]) / 24.0
+    # Transit duration in Kepler long-cadence cadences (29.4 min per cadence)
+    transit_dur_cadences = (dur_days * 1440.0) / 29.4
 
     time_parts, flux_parts = [], []
-    for tpf in tpf_list:
-        try:
-            lc = tpf.to_lightcurve(aperture_mask="pipeline")
-            t = lc.time.bkjd
-            f = np.array(lc.flux.value, dtype=np.float64)
-            # Per-quarter median normalisation (replicate stitch behaviour)
-            med = np.nanmedian(f)
-            if med == 0 or not np.isfinite(med):
+
+    # ── Primary source: PDC-SAP from local LC files ──────────────────────────
+    lc_list = load_local_lcs(kepid, tpf_dir, None)  # all quarters; no cap on LC
+
+    if lc_list:
+        for lc in lc_list:
+            try:
+                t = lc.time.bkjd
+                # PDC-SAP is the default flux column for Kepler LC files in lightkurve
+                f = np.array(lc.flux.value, dtype=np.float64)
+
+                if np.all(np.isnan(f)):
+                    # Fall back to SAP flux from the same LC file for this quarter
+                    log_failure(
+                        "failed_targets.log",
+                        f"KIC {kepid} {row['kepoi_name']}: pdcsap_flux all-NaN "
+                        f"— falling back to sap_flux",
+                    )
+                    try:
+                        f = np.array(lc["sap_flux"].value, dtype=np.float64)
+                    except Exception as sap_exc:
+                        log_failure(
+                            "failed_targets.log",
+                            f"KIC {kepid} {row['kepoi_name']}: sap_flux fallback "
+                            f"also failed: {type(sap_exc).__name__}: {sap_exc}",
+                        )
+                        continue
+
+                # Per-quarter median normalisation
+                med = np.nanmedian(f)
+                if med == 0 or not np.isfinite(med):
+                    continue
+                f = f / med
+
+                # Savitzky-Golay detrending: removes stellar variability and
+                # quarter-level trends even when PDC flux is available
+                f = _sg_detrend(f, transit_dur_cadences)
+
+                # Re-normalise to median 1.0 after SG detrending (safeguard against
+                # residual baseline offset from SG division on short quarters)
+                med2 = np.nanmedian(f)
+                if np.isfinite(med2) and med2 != 0:
+                    f = f / med2
+
+                time_parts.append(t)
+                flux_parts.append(f)
+
+            except Exception as exc:
+                log_failure(
+                    "failed_targets.log",
+                    f"KIC {kepid} {row['kepoi_name']}: LC flux extraction: "
+                    f"{type(exc).__name__}: {exc}",
+                )
                 continue
-            time_parts.append(t)
-            flux_parts.append(f / med)
-        except Exception as exc:
-            log_failure("failed_targets.log",
-                        f"KIC {kepid} {row['kepoi_name']}: flux lc extraction: "
-                        f"{type(exc).__name__}: {exc}")
-            continue
+
+    else:
+        # ── Fallback: SAP from TPF (no LC files available) ──────────────────
+        log_failure(
+            "failed_targets.log",
+            f"KIC {kepid}: no LC files — using SAP fallback from TPF",
+        )
+        for tpf in tpf_list:
+            try:
+                lc = tpf.to_lightcurve(aperture_mask="pipeline")
+                t = lc.time.bkjd
+                f = np.array(lc.flux.value, dtype=np.float64)
+
+                med = np.nanmedian(f)
+                if med == 0 or not np.isfinite(med):
+                    continue
+                f = f / med
+
+                # SG detrending still applied for SAP fallback
+                f = _sg_detrend(f, transit_dur_cadences)
+
+                med2 = np.nanmedian(f)
+                if np.isfinite(med2) and med2 != 0:
+                    f = f / med2
+
+                time_parts.append(t)
+                flux_parts.append(f)
+
+            except Exception as exc:
+                log_failure(
+                    "failed_targets.log",
+                    f"KIC {kepid} {row['kepoi_name']}: SAP flux extraction: "
+                    f"{type(exc).__name__}: {exc}",
+                )
+                continue
 
     if not time_parts:
         return
@@ -584,6 +1162,15 @@ def _compute_flux_cache(row: pd.Series, tpf_list: list, out_path: str) -> None:
     good = np.abs(flux_arr - med) <= 3 * std
     time_arr, flux_arr = time_arr[good], flux_arr[good]
 
+    # Multi-planet masking: exclude cadences contaminated by other KOIs' transits.
+    # Applied before phase-folding so the OOT baseline is not contaminated by
+    # other planets' transits contributing spurious depth to the folded flux.
+    other_kois = koi_rows[koi_rows["kepoi_name"] != row["kepoi_name"]]
+    if len(other_kois) > 0:
+        mp_mask = _compute_transit_mask(time_arr, other_kois)
+        time_arr = time_arr[mp_mask]
+        flux_arr = flux_arr[mp_mask]
+
     # Phase fold — t0_bkjd already in BKJD
     phase = ((time_arr - t0_bkjd) / period) % 1.0
     phase[phase > 0.5] -= 1.0
@@ -591,6 +1178,17 @@ def _compute_flux_cache(row: pd.Series, tpf_list: list, out_path: str) -> None:
     half_window = 1.5 * (dur_days / period)
     oot_mask = np.abs(phase) > half_window
     oot_flux = flux_arr[oot_mask]
+
+    # Require at least 50 OOT cadences after multi-planet masking; fewer cadences
+    # means the OOT baseline would be unreliable for normalisation
+    if oot_mask.sum() < 50:
+        log_failure(
+            "failed_targets.log",
+            f"MASK: KIC {kepid} {row['kepoi_name']}: insufficient OOT cadences "
+            f"({oot_mask.sum()}) after multi-planet mask — skipped",
+        )
+        return
+
     if len(oot_flux) < 10:
         return
     flux_arr = flux_arr / np.nanmedian(oot_flux)
@@ -651,6 +1249,12 @@ def _compute_centroid_cache(
     The difference-image centroid uses koi_rows.iloc[0]'s ephemeris as a proxy for
     the star's transit timing. For multi-KOI systems this is an acknowledged
     approximation — centroids are per-star, not per-planet.
+
+    Multi-planet masking is applied after concatenating the per-quarter time/m1/m2
+    arrays (before phase-folding) to exclude cadences contaminated by other KOIs'
+    transits. This ensures OOT centroid statistics are not contaminated by transits
+    of other planets on the same star.
+
     koi_time0bk is in BKJD — use directly; do NOT subtract 2457000 (TESS offset).
     """
     row = koi_rows.iloc[0]
@@ -710,11 +1314,30 @@ def _compute_centroid_cache(
     m1_arr = m1_arr[idx]
     m2_arr = m2_arr[idx]
 
+    # Multi-planet masking: exclude cadences contaminated by other KOIs' transits.
+    # The centroid cache uses koi_rows.iloc[0] as the reference KOI; all other
+    # KOIs on this star are treated as contaminants.
+    other_kois = koi_rows[koi_rows["kepoi_name"] != row["kepoi_name"]]
+    if len(other_kois) > 0:
+        mp_mask = _compute_transit_mask(time_arr, other_kois)
+        time_arr = time_arr[mp_mask]
+        m1_arr = m1_arr[mp_mask]
+        m2_arr = m2_arr[mp_mask]
+
     # Phase fold — t0_bkjd is BKJD
     phase = ((time_arr - t0_bkjd) / period) % 1.0
     phase[phase > 0.5] -= 1.0
     half_window = 1.5 * (dur_days / period)
     oot_mask = np.abs(phase) > half_window
+
+    # Require at least 50 OOT cadences for reliable centroid statistics
+    if oot_mask.sum() < 50:
+        log_failure(
+            "failed_targets.log",
+            f"MASK: KIC {kepid} k={k} psf={psf}: insufficient OOT cadences "
+            f"({oot_mask.sum()}) after multi-planet mask — skipped",
+        )
+        return
 
     # Compute quality metrics
     offset_median = float(np.median(diff_offsets)) if diff_offsets else np.nan
@@ -753,15 +1376,40 @@ def write_training_csvs(
     A star with two planets writes two CSV rows (one per KOI) using the shared
     centroid data but each KOI's own flux series.
 
-    Output schema (3009 columns):
-      kepid, kepoi_name, label, fp_subtype, koi_period, koi_time0bk, koi_duration,
-      f_0..f_999, m1_0..m1_999, m2_0..m2_999
+    Output schema (971 columns per row):
+      7 metadata: kepid, kepoi_name, label, fp_subtype, koi_period, koi_time0bk,
+                  koi_duration
+      f_0..f_300   (301 global flux bins — OOT-normalised, OOT-standardised)
+      m1_0..m1_300 (301 global RA centroid bins at scale k; OOT-baseline removed)
+      m2_0..m2_300 (301 global Dec centroid bins; same normalisation)
+      l_0..l_60    (61 adaptive local flux bins, pre-computed via _extract_local_bins;
+                   window = ±2×transit_duration in phase, resampled onto 61 points)
+
+    Total feature columns: 301×3 + 61 = 964. Total columns: 964 + 7 = 971.
+
+    Global bins (301) feed the global CNN branch. Local bins (61) are a per-target
+    adaptive resample centred on the transit, stored pre-computed to avoid runtime
+    re-interpolation during theModel.py training.
 
     Returns:
         csv_counts dict[(k, psf)] → int rows written, for the attrition report.
     """
     flux_dir = os.path.join(cache_dir, "flux")
     centroid_dir = os.path.join(cache_dir, "centroids")
+
+    if not os.path.isdir(centroid_dir):
+        print(
+            f"\nERROR: centroid cache directory not found: {centroid_dir}\n"
+            f"Run '--phase cache --tpf-dir <path>' first to build it.\n"
+            f"If your cache is on an external volume, pass '--cache-dir <path>' too."
+        )
+        return {}
+    if not os.path.isdir(flux_dir):
+        print(
+            f"\nERROR: flux cache directory not found: {flux_dir}\n"
+            f"Run '--phase cache --tpf-dir <path>' first to build it."
+        )
+        return {}
 
     koi_by_kepid = manifest.groupby("kepid")
     unique_kepids = manifest["kepid"].unique()
@@ -781,6 +1429,11 @@ def write_training_csvs(
                 centroid_path = os.path.join(centroid_dir,
                                              f"{kepid}_k{k}_psf{psf}.npz")
                 if not os.path.exists(centroid_path):
+                    log_failure(
+                        "failed_targets.log",
+                        f"KIC {kepid} k={k} psf={psf}: centroid cache missing — "
+                        f"run '--phase cache' to build it",
+                    )
                     skipped += len(koi_by_kepid.get_group(kepid))
                     continue
 
@@ -839,12 +1492,28 @@ def write_training_csvs(
                     flux_path = os.path.join(flux_dir, f"{kepoi_name}.npz")
 
                     if not os.path.exists(flux_path):
+                        log_failure(
+                            "failed_targets.log",
+                            f"KIC {kepid} {kepoi_name} k={k} psf={psf}: "
+                            f"flux cache missing — run '--phase cache' to build it",
+                        )
                         skipped += 1
                         continue
 
                     try:
                         flux_data = np.load(flux_path)
                         flux_binned = flux_data["flux_binned"]
+                        bin_centres = flux_data["bin_centres"]
+
+                        # Adaptive local view: per-target 61-bin resample centred on
+                        # the transit (±2×transit_duration in phase). Pre-computed here
+                        # and stored as l_0..l_60 to avoid re-interpolation in theModel.py.
+                        dur_days = float(row["koi_duration"]) / 24.0
+                        local_binned = _extract_local_bins(
+                            flux_binned, bin_centres,
+                            dur_days=dur_days,
+                            period=float(row["koi_period"]),
+                        )
 
                         entry = {
                             "kepid": kepid,
@@ -855,12 +1524,18 @@ def write_training_csvs(
                             "koi_time0bk": row["koi_time0bk"],
                             "koi_duration": row["koi_duration"],
                         }
+                        # Global flux bins: f_0..f_{NUM_BINS-1}
                         for i in range(NUM_BINS):
                             entry[f"f_{i}"] = float(flux_binned[i])
+                        # Global RA centroid bins
                         for i in range(NUM_BINS):
                             entry[f"m1_{i}"] = float(m1_binned[i])
+                        # Global Dec centroid bins
                         for i in range(NUM_BINS):
                             entry[f"m2_{i}"] = float(m2_binned[i])
+                        # Adaptive local flux bins: l_0..l_{LOCAL_BINS-1}
+                        for i in range(LOCAL_BINS):
+                            entry[f"l_{i}"] = float(local_binned[i])
 
                         df_row = pd.DataFrame([entry])
                         df_row.to_csv(csv_path, mode="a",
@@ -893,7 +1568,7 @@ def write_data_attrition_report(
 
     Sources:
       - manifest: total KOI and confirmed/FP counts
-      - failed_targets.log: zero-local-TPF skips
+      - failed_targets.log: zero-local-TPF skips, LC failures, masking skips
       - sparse_targets.log: sparsity filter skips
       - csv_counts: final row counts per (k, psf) from write_training_csvs
 
@@ -978,11 +1653,12 @@ def write_data_attrition_report(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Load local Kepler TPFs and build per-k training CSVs"
+        description="Load local Kepler TPFs/LCs and build per-k training CSVs"
     )
     parser.add_argument(
         "--max-quarters", type=int, default=None,
-        help="Cap the number of quarters per target (default: all available)"
+        help="Cap the number of TPF quarters per target (default: all available). "
+             "LC downloads always use all available quarters regardless of this flag."
     )
     parser.add_argument(
         "--phase",
@@ -990,8 +1666,8 @@ def main():
         default="all",
         help=(
             "Pipeline phase to run: "
-            "'download' = TPF download only; "
-            "'cache' = build degraded cache from existing local TPFs; "
+            "'download' = TPF + LC download only; "
+            "'cache' = build degraded cache from existing local files; "
             "'csv-only' = write training CSVs from existing cache; "
             "'all' (default) = run all phases in order"
         ),
@@ -1007,12 +1683,11 @@ def main():
     parser.add_argument(
         "--tpf-dir", default="./tpf_temp",
         help=(
-            "Directory for Kepler TPF FITS files "
+            "Directory for Kepler TPF and LC FITS files "
             "(default: ./tpf_temp, which is gitignored). "
             "Scanned recursively — a path like "
             "'/Volumes/Stuff/Research Work/TPFs' works directly. "
-            "If you specify a custom path, add it to .gitignore manually — "
-            "TPF archives can be tens of GB."
+            "LC files are downloaded into the same directory tree as TPFs."
         ),
     )
     parser.add_argument(
@@ -1022,7 +1697,7 @@ def main():
     parser.add_argument(
         "--workers", type=int, default=8,
         help=(
-            "Number of concurrent S3 download threads (default: 8). "
+            "Number of concurrent download threads (default: 8). "
             "Has no effect with --phase csv-only."
         ),
     )
@@ -1065,6 +1740,12 @@ def main():
         enable_cloud_storage()
         download_tpfs(
             manifest, tpf_dir, cache_dir, args.max_quarters,
+            n_workers=args.workers,
+            search_rate=args.search_rate,
+        )
+        # Phase 1c: also download LC files (PDC-SAP source; all quarters)
+        download_lcs(
+            manifest, tpf_dir, cache_dir,
             n_workers=args.workers,
             search_rate=args.search_rate,
         )

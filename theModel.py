@@ -4,13 +4,21 @@ theModel.py — Dual-Branch 1D CNN for Kepler Exoplanet Centroid Degradation Stu
 Architecture: Two parallel convolutional branches whose outputs are concatenated
 before a regularised classification head.
   - Global branch: all 3 channels (flux=ch0, RA centroid=ch1, Dec centroid=ch2)
-    × 1000 phase bins. Learns coarse features: centroid trends, OOT variability.
-  - Local branch: flux channel only (ch0), central 200 bins (transit window).
+    × 301 phase bins. Learns coarse features: centroid trends, OOT variability.
+  - Local branch: flux channel only (ch0), 61-bin adaptive transit-centred window.
     Learns fine transit morphology: flat-bottom vs V-shape, ingress sharpness.
+    The local view is an adaptive per-target resample stored as l_0..l_60 in the
+    training CSV (±2×transit_duration in phase, resampled to 61 bins via np.interp).
+    It is NOT sliced from the global tensor at training time.
 
 Architecture and training configuration are FROZEN. Do not modify them.
-The channel layout (flux=0, m1=1, m2=2) is preserved; the local branch slices
-channel 0 exactly as before.
+The channel layout (flux=0, m1=1, m2=2) is preserved.
+
+# ARCHITECTURE NOTE: Input dimensions changed from (1000, 3) global + (200, 1) local
+# to (301, 3) global + (61, 1) local after preprocessing overhaul.
+# Local input is now a pre-computed adaptive window stored in l_0..l_60 CSV columns.
+# The local branch no longer slices the global tensor — LOCAL_START / LOCAL_END removed.
+# Do not revert these dimensions without also rebuilding the training CSVs.
 
 Changes from the prior TESS version:
   - CV uses StratifiedGroupKFold keyed on kepid (no KIC target leakage)
@@ -22,7 +30,7 @@ Changes from the prior TESS version:
   - OUTPUT_DIR → results_resolution/
 
 All other code (focal loss, optimiser, LR schedule, augmentations, architecture)
-is untouched from the working TESS version.
+is untouched from the working TESS version except dimension updates.
 
 Outputs (per k, psf):
   - results_resolution/scores_k{K}_psf{P}.csv  — per-target test-set scores
@@ -60,15 +68,16 @@ from sklearn.metrics import (
 # CONFIGURATION — architecture/training constants frozen; do not change
 # ─────────────────────────────────────────────────────────────────────────────
 
-OUTPUT_DIR   = "results_resolution"
-NUM_BINS     = 1000
-LOCAL_START  = 400   # Central 200 bins capture the transit window (phase ≈ ±0.1)
-LOCAL_END    = 600
-N_FOLDS      = 5
-EPOCHS       = 120
-BATCH_SIZE   = 32
-RANDOM_SEED  = 42
-TEST_FRAC    = 0.20   # 20% of unique kepids held out as test set
+OUTPUT_DIR  = "results_resolution"
+NUM_BINS    = 301   # global phase bins (was 1000; matches AstroNet global view)
+LOCAL_BINS  = 61    # adaptive local view bins (was 200 slice-based; now pre-computed)
+# LOCAL_START / LOCAL_END removed: local input is now read from l_0..l_60 CSV columns,
+# not sliced from the global tensor at training time.
+N_FOLDS     = 5
+EPOCHS      = 120
+BATCH_SIZE  = 32
+RANDOM_SEED = 42
+TEST_FRAC   = 0.20   # 20% of unique kepids held out as test set
 
 # Class weights: down-weight the planet class so FP misclassifications
 # contribute proportionally more to the loss and gradient updates.
@@ -85,15 +94,31 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def load_and_preprocess(csv_path):
     """
-    Load the per-k training CSV and reshape flat columns into a (N, 1000, 3) tensor.
+    Load the per-k training CSV and reshape flat columns into:
+      X_global: (N, 301, 3) — global phase-folded view, channels-last
+      X_local:  (N,  61, 1) — adaptive transit-centred local view, channels-last
+
     TensorFlow's Conv1D expects channels-last: (batch, length, channels).
 
-    Channel layout (FROZEN — do not change):
-      channel 0 = flux  (clipped ±10; local branch slices this channel)
+    Channel layout for X_global (FROZEN — do not change):
+      channel 0 = flux  (clipped ±10)
       channel 1 = m1    (RA flux-weighted moment centroid at scale k)
       channel 2 = m2    (Dec centroid)
 
+    X_local is the pre-computed adaptive local window stored as l_0..l_60 in
+    the CSV (flux channel only; computed by _extract_local_bins in getInputData.py).
+    Phase jitter augmentation is NOT applied to X_local at training time — rolling
+    a transit-centred resample defeats the purpose of centring it.
+
     Also returns kepid_arr and fp_subtype_arr for grouping and subgroup analysis.
+
+    Returns:
+        X_global:      (N, 301, 3) float32 array
+        X_local:       (N,  61, 1) float32 array
+        y:             (N,) int32 labels
+        kepid_arr:     (N,) int array of KIC IDs
+        fp_subtype:    (N,) str array of FP subtype codes
+        n:             total example count
     """
     print(f"Loading dataset: {csv_path}")
     df = pd.read_csv(csv_path)
@@ -103,22 +128,30 @@ def load_and_preprocess(csv_path):
           f"Label 1 (Planet): {(df['label']==1).sum()}  |  "
           f"{df['kepid'].nunique()} unique KIC targets")
 
+    # Global view: 301 bins × 3 channels
     flux   = df[[f"f_{i}"  for i in range(NUM_BINS)]].values.astype(np.float32)
     centr1 = df[[f"m1_{i}" for i in range(NUM_BINS)]].values.astype(np.float32)
     centr2 = df[[f"m2_{i}" for i in range(NUM_BINS)]].values.astype(np.float32)
 
     flux = np.clip(flux, -10.0, 10.0)
 
-    # Stack to (N, 1000, 3) — channels last; ch0=flux, ch1=m1, ch2=m2
-    X = np.stack([flux, centr1, centr2], axis=2)
-    X = np.nan_to_num(X, nan=0.0)
+    # Stack to (N, 301, 3) — channels last; ch0=flux, ch1=m1, ch2=m2
+    X_global = np.stack([flux, centr1, centr2], axis=2)
+    X_global = np.nan_to_num(X_global, nan=0.0)
+
+    # Local view: 61 adaptive bins, flux channel only
+    local = df[[f"l_{i}" for i in range(LOCAL_BINS)]].values.astype(np.float32)
+    local = np.clip(local, -10.0, 10.0)
+    X_local = local[:, :, np.newaxis]       # (N, 61, 1)
+    X_local = np.nan_to_num(X_local, nan=0.0)
 
     y           = df["label"].values.astype(np.int32)
     kepid_arr   = df["kepid"].values
     fp_subtype  = df.get("fp_subtype", pd.Series([""] * n)).values
 
-    print(f"  Tensor shape: {X.shape}  dtype: {X.dtype}")
-    return X, y, kepid_arr, fp_subtype, n
+    print(f"  Global tensor shape: {X_global.shape}  dtype: {X_global.dtype}")
+    print(f"  Local  tensor shape: {X_local.shape}  dtype: {X_local.dtype}")
+    return X_global, X_local, y, kepid_arr, fp_subtype, n
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -128,25 +161,34 @@ def load_and_preprocess(csv_path):
 class AugmentedSequence(Sequence):
     """
     A Keras Sequence that applies three physically motivated augmentations
-    to each training batch on-the-fly. Using a Sequence rather than a manual
-    loop means we can safely pass this into model.fit(), getting all the
-    stability benefits of Keras's training loop (correct callback behaviour,
-    proper gradient accumulation, etc.) while still augmenting each batch.
+    to the global branch input on-the-fly per training batch. The local branch
+    input (X_local) is kept fixed — rolling or scaling an adaptive transit-centred
+    resample would destroy the transit alignment that is the local view's purpose.
 
-    Augmentations are applied ONLY during training. The validation data
-    is passed directly to model.fit()'s validation_data argument as a plain
-    numpy array, so it is never augmented.
+    Augmentations applied to X_global only:
+      1. Phase jitter: roll the full 301-bin light curve by ±20 bins.
+         Prevents the model learning "the dip is always at bin 150" and makes
+         it robust to small errors in the reported transit epoch.
+      2. Gaussian noise on flux channel (ch0) only.
+         Simulates photon noise variability between observing epochs.
+      3. Flux scaling: multiply flux channel by a factor drawn from [0.95, 1.05].
+         Simulates transit depth uncertainty due to dilution or stellar variability.
+
+    Using a Sequence rather than a manual loop means we can safely pass this into
+    model.fit(), getting all the stability benefits of Keras's training loop.
+    Augmentations are ONLY applied during training; validation data is never augmented.
     """
-    def __init__(self, X, y, batch_size, shuffle=True):
-        self.X          = X
+    def __init__(self, X_global, X_local, y, batch_size, shuffle=True):
+        self.X_global   = X_global
+        self.X_local    = X_local
         self.y          = y
         self.batch_size = batch_size
         self.shuffle    = shuffle
-        self.indices    = np.arange(len(X))
+        self.indices    = np.arange(len(X_global))
         self.on_epoch_end()
 
     def __len__(self):
-        return len(self.X) // self.batch_size
+        return len(self.X_global) // self.batch_size
 
     def on_epoch_end(self):
         # Reshuffle training order each epoch so the model cannot
@@ -156,52 +198,51 @@ class AugmentedSequence(Sequence):
 
     def __getitem__(self, idx):
         batch_idx = self.indices[idx * self.batch_size:(idx + 1) * self.batch_size]
-        X_batch   = self.X[batch_idx].copy()
-        y_batch   = self.y[batch_idx]
+        X_global_batch = self.X_global[batch_idx].copy()
+        X_local_batch  = self.X_local[batch_idx]          # no copy — not augmented
+        y_batch        = self.y[batch_idx]
 
-        for i in range(len(X_batch)):
-            # 1. Phase jitter: roll the entire light curve by ±20 bins along
-            #    the time axis (axis=0 in channels-last format).
-            #    Prevents the model learning "the dip is always at bin 500"
-            #    and makes it robust to small errors in the reported epoch.
+        for i in range(len(X_global_batch)):
+            # 1. Phase jitter: roll the entire global light curve by ±20 bins.
             shift = np.random.randint(-20, 21)
-            X_batch[i] = np.roll(X_batch[i], shift, axis=0)
+            X_global_batch[i] = np.roll(X_global_batch[i], shift, axis=0)
 
-            # 2. Gaussian noise on the flux channel only.
-            #    In channels-last format, channel 0 is accessed as [:, 0].
-            #    Simulates photon noise variability between observing epochs.
-            X_batch[i, :, 0] += np.random.normal(0, 0.02, NUM_BINS).astype(np.float32)
+            # 2. Gaussian noise on the flux channel only (channels-last: [:, 0]).
+            X_global_batch[i, :, 0] += np.random.normal(
+                0, 0.02, NUM_BINS).astype(np.float32)
 
             # 3. Flux scaling: multiply flux by a factor drawn from [0.95, 1.05].
-            #    Simulates transit depth uncertainty due to dilution or stellar
-            #    variability, normalising for amplitude differences between targets.
-            X_batch[i, :, 0] *= np.random.uniform(0.95, 1.05)
+            X_global_batch[i, :, 0] *= np.random.uniform(0.95, 1.05)
 
-        return self._split_inputs(X_batch), y_batch
-
-    @staticmethod
-    def _split_inputs(X):
-        global_in = X                                     # (batch, 1000, 3)
-        local_in  = X[:, LOCAL_START:LOCAL_END, 0:1]      # (batch, 200,  1)
-        return (global_in, local_in)
+        return (X_global_batch, X_local_batch), y_batch
 
 
-def split_inputs(X):
-    """Split a full tensor into the two combined-model branch inputs without augmentation."""
-    return (X, X[:, LOCAL_START:LOCAL_END, 0:1])
-
-
-def split_inputs_flux_only(X):
-    """Split for flux-only ablation: global = ch0 full, local = ch0 central 200 bins."""
-    return (X[:, :, 0:1], X[:, LOCAL_START:LOCAL_END, 0:1])
-
-
-def split_inputs_centroid_only(X):
+def split_inputs(X_global, X_local):
     """
-    Split for centroid-only ablation: both branches receive the full centroid sequence
-    (ch1, ch2). No local branch — both global branches see all 1000 bins.
+    Return the two-branch model inputs as a tuple, without augmentation.
+    Used for validation and inference.
     """
-    centroid = X[:, :, 1:3]
+    return (X_global, X_local)
+
+
+def split_inputs_flux_only(X_global, X_local):
+    """
+    Split for flux-only ablation: global branch receives flux channel only
+    (shape (N, 301, 1)); local branch receives the pre-computed adaptive local
+    window (already flux-only, shape (N, 61, 1)).
+    """
+    return (X_global[:, :, 0:1], X_local)
+
+
+def split_inputs_centroid_only(X_global, X_local):
+    """
+    Split for centroid-only ablation: both branches receive the full centroid
+    sequence (ch1=RA, ch2=Dec from X_global), shape (N, 301, 2). The local
+    branch is not used — slicing the central bins of a centroid series has no
+    physical transit-morphology interpretation — so both input slots receive the
+    same centroid array.
+    """
+    centroid = X_global[:, :, 1:3]
     return (centroid, centroid)
 
 
@@ -294,27 +335,24 @@ def build_model():
     regulariser — averaging rather than selecting the max makes it less
     prone to latching onto single-timestep outliers.
 
-    Batch Normalisation after each Conv1D layer:
-      - Normalises activations within each mini-batch, stabilising training
-      - Particularly valuable for small datasets where batch statistics are noisy
-      - Acts as a mild regulariser, allowing convergence to better solutions
-      - Allows modest increase in filter counts without overfitting
+    Global branch pooling: MaxPooling1D(4) → 301→75, then MaxPooling1D(5) → 75→15.
+    Local branch pooling:  MaxPooling1D(3) → 61→20, then GlobalAveragePooling.
     """
 
     # ── Global branch: full orbit, all 3 channels ────────────────────────────
-    global_input = keras.Input(shape=(1000, 3), name="global_input")
+    global_input = keras.Input(shape=(301, 3), name="global_input")
 
     x = layers.Conv1D(32, kernel_size=5, padding="same",
                       kernel_regularizer=regularizers.l2(1e-4))(global_input)
     x = layers.BatchNormalization()(x)
     x = layers.Activation("relu")(x)
-    x = layers.MaxPooling1D(pool_size=5)(x)                    # 1000 → 200
+    x = layers.MaxPooling1D(pool_size=4)(x)                    # 301 → 75
 
     x = layers.Conv1D(64, kernel_size=5, padding="same",
                       kernel_regularizer=regularizers.l2(1e-4))(x)
     x = layers.BatchNormalization()(x)
     x = layers.Activation("relu")(x)
-    x = layers.MaxPooling1D(pool_size=5)(x)                    # 200 → 40
+    x = layers.MaxPooling1D(pool_size=5)(x)                    # 75  → 15
 
     x = layers.Conv1D(128, kernel_size=5, padding="same",
                       kernel_regularizer=regularizers.l2(1e-4))(x)
@@ -322,14 +360,15 @@ def build_model():
     x = layers.Activation("relu")(x)
     global_out = layers.GlobalAveragePooling1D()(x)            # → (128,)
 
-    # ── Local branch: transit window only, flux channel ──────────────────────
-    local_input = keras.Input(shape=(200, 1), name="local_input")
+    # ── Local branch: adaptive transit window, flux channel only ─────────────
+    # Input is pre-computed l_0..l_60 (61 bins), not sliced from the global tensor.
+    local_input = keras.Input(shape=(61, 1), name="local_input")
 
     y = layers.Conv1D(32, kernel_size=5, padding="same",
                       kernel_regularizer=regularizers.l2(1e-4))(local_input)
     y = layers.BatchNormalization()(y)
     y = layers.Activation("relu")(y)
-    y = layers.MaxPooling1D(pool_size=4)(y)                    # 200 → 50
+    y = layers.MaxPooling1D(pool_size=3)(y)                    # 61  → 20
 
     y = layers.Conv1D(64, kernel_size=5, padding="same",
                       kernel_regularizer=regularizers.l2(1e-4))(y)
@@ -367,22 +406,24 @@ def build_model_flux_only():
     channel only (ch0). Used to establish the baseline performance achievable
     from transit morphology alone, with no centroid information.
 
-    Architecture mirrors the combined model exactly, with input channels = 1.
+    Architecture mirrors the combined model exactly:
+      Global: (301, 1), same pooling (4 then 5)
+      Local:  (61,  1), same pooling (3)
     """
     # ── Global branch: full orbit, flux only ────────────────────────────────
-    global_input = keras.Input(shape=(1000, 1), name="global_input")
+    global_input = keras.Input(shape=(301, 1), name="global_input")
 
     x = layers.Conv1D(32, kernel_size=5, padding="same",
                       kernel_regularizer=regularizers.l2(1e-4))(global_input)
     x = layers.BatchNormalization()(x)
     x = layers.Activation("relu")(x)
-    x = layers.MaxPooling1D(pool_size=5)(x)
+    x = layers.MaxPooling1D(pool_size=4)(x)                    # 301 → 75
 
     x = layers.Conv1D(64, kernel_size=5, padding="same",
                       kernel_regularizer=regularizers.l2(1e-4))(x)
     x = layers.BatchNormalization()(x)
     x = layers.Activation("relu")(x)
-    x = layers.MaxPooling1D(pool_size=5)(x)
+    x = layers.MaxPooling1D(pool_size=5)(x)                    # 75  → 15
 
     x = layers.Conv1D(128, kernel_size=5, padding="same",
                       kernel_regularizer=regularizers.l2(1e-4))(x)
@@ -390,14 +431,14 @@ def build_model_flux_only():
     x = layers.Activation("relu")(x)
     global_out = layers.GlobalAveragePooling1D()(x)            # → (128,)
 
-    # ── Local branch: transit window, flux only ──────────────────────────────
-    local_input = keras.Input(shape=(200, 1), name="local_input")
+    # ── Local branch: adaptive transit window, flux only ─────────────────────
+    local_input = keras.Input(shape=(61, 1), name="local_input")
 
     y = layers.Conv1D(32, kernel_size=5, padding="same",
                       kernel_regularizer=regularizers.l2(1e-4))(local_input)
     y = layers.BatchNormalization()(y)
     y = layers.Activation("relu")(y)
-    y = layers.MaxPooling1D(pool_size=4)(y)
+    y = layers.MaxPooling1D(pool_size=3)(y)                    # 61  → 20
 
     y = layers.Conv1D(64, kernel_size=5, padding="same",
                       kernel_regularizer=regularizers.l2(1e-4))(y)
@@ -430,31 +471,33 @@ def build_model_centroid_only():
     Centroid-only ablation variant of the dual-branch CNN.
 
     Removes the flux channel entirely — both branches operate on centroid channels
-    (ch1=RA, ch2=Dec). The local branch is omitted (slicing the central 200 bins
-    of a centroid series has no physical transit-morphology interpretation).
+    (ch1=RA, ch2=Dec from X_global), shape (N, 301, 2). The local transit-window
+    view is not used — slicing the central bins of a centroid series has no
+    physical transit-morphology interpretation — so both input slots receive the
+    same full centroid sequence.
 
-    Instead, two global branches process the full 1000-bin centroid sequence:
-      Branch 1 (3 Conv1D blocks, 32→64→128 filters) mirrors the combined global branch.
-      Branch 2 (2 Conv1D blocks, 32→64 filters) mirrors the combined local-branch
-        architecture but on the full sequence rather than a central slice.
+    Branch 1 (3 Conv1D blocks, 32→64→128 filters, pools 4 then 5) mirrors the
+      combined global branch.
+    Branch 2 (2 Conv1D blocks, 32→64 filters, pool 3) mirrors the combined local-
+      branch architecture but on the full centroid sequence.
 
     Used to isolate the contribution of centroid information alone, without transit
     morphology features. Performance degrades with k as centroid SNR decreases.
     """
     # ── Branch 1: full centroid sequence, 3-block architecture ──────────────
-    global_input_1 = keras.Input(shape=(1000, 2), name="global_input_1")
+    global_input_1 = keras.Input(shape=(301, 2), name="global_input_1")
 
     x = layers.Conv1D(32, kernel_size=5, padding="same",
                       kernel_regularizer=regularizers.l2(1e-4))(global_input_1)
     x = layers.BatchNormalization()(x)
     x = layers.Activation("relu")(x)
-    x = layers.MaxPooling1D(pool_size=5)(x)
+    x = layers.MaxPooling1D(pool_size=4)(x)                    # 301 → 75
 
     x = layers.Conv1D(64, kernel_size=5, padding="same",
                       kernel_regularizer=regularizers.l2(1e-4))(x)
     x = layers.BatchNormalization()(x)
     x = layers.Activation("relu")(x)
-    x = layers.MaxPooling1D(pool_size=5)(x)
+    x = layers.MaxPooling1D(pool_size=5)(x)                    # 75  → 15
 
     x = layers.Conv1D(128, kernel_size=5, padding="same",
                       kernel_regularizer=regularizers.l2(1e-4))(x)
@@ -463,13 +506,13 @@ def build_model_centroid_only():
     branch1_out = layers.GlobalAveragePooling1D()(x)           # → (128,)
 
     # ── Branch 2: same centroid sequence, 2-block architecture ──────────────
-    global_input_2 = keras.Input(shape=(1000, 2), name="global_input_2")
+    global_input_2 = keras.Input(shape=(301, 2), name="global_input_2")
 
     y = layers.Conv1D(32, kernel_size=5, padding="same",
                       kernel_regularizer=regularizers.l2(1e-4))(global_input_2)
     y = layers.BatchNormalization()(y)
     y = layers.Activation("relu")(y)
-    y = layers.MaxPooling1D(pool_size=4)(y)
+    y = layers.MaxPooling1D(pool_size=3)(y)                    # 301 → 100
 
     y = layers.Conv1D(64, kernel_size=5, padding="same",
                       kernel_regularizer=regularizers.l2(1e-4))(y)
@@ -501,7 +544,8 @@ def build_model_centroid_only():
 # SECTION 6 — TRAINING
 # ═════════════════════════════════════════════════════════════════════════════
 
-def train_fold(X_train, y_train, X_val, y_val):
+def train_fold(X_global_train, y_train, X_global_val, y_val,
+               X_local_train, X_local_val):
     """
     Train one fold using model.fit() with proper Keras callbacks.
 
@@ -522,10 +566,20 @@ def train_fold(X_train, y_train, X_val, y_val):
          enabling fine-grained convergence without overshooting
       3. EarlyStopping — stop and restore best weights when val AUC fails
          to improve for 15 epochs, preventing overtraining
+
+    Args:
+        X_global_train: (N_train, 301, 3) training global input
+        y_train:        (N_train,) labels
+        X_global_val:   (N_val, 301, 3) validation global input
+        y_val:          (N_val,) labels
+        X_local_train:  (N_train, 61, 1) training local input
+        X_local_val:    (N_val, 61, 1) validation local input
     """
     model     = build_model()
-    train_gen = AugmentedSequence(X_train, y_train, BATCH_SIZE, shuffle=True)
-    val_data  = (split_inputs(X_val), y_val)
+    train_gen = AugmentedSequence(
+        X_global_train, X_local_train, y_train, BATCH_SIZE, shuffle=True
+    )
+    val_data  = (split_inputs(X_global_val, X_local_val), y_val)
 
     callbacks = [
         # Warm up learning rate from 1e-4 to 1e-3 over first 5 epochs
@@ -578,15 +632,23 @@ def find_best_threshold(y_true, y_prob):
     return best_thresh, best_f1
 
 
-def evaluate_fold(model, X_val, y_val):
+def evaluate_fold(model, X_global_val, X_local_val, y_val):
     """
     Compute all metrics for one validation fold with optimised threshold.
+
+    Args:
+        model:         trained Keras model
+        X_global_val:  (N_val, 301, 3) validation global input
+        X_local_val:   (N_val,  61, 1) validation local input
+        y_val:         (N_val,) true labels
 
     Returns:
         metrics: dict of per-fold metrics
         y_prob:  raw sigmoid probabilities (for OOF threshold optimisation)
     """
-    y_prob = model.predict(split_inputs(X_val), verbose=0, batch_size=64).flatten()
+    y_prob = model.predict(
+        split_inputs(X_global_val, X_local_val), verbose=0, batch_size=64
+    ).flatten()
     best_thresh, _ = find_best_threshold(y_val, y_prob)
     y_pred = (y_prob >= best_thresh).astype(int)
     print(f"    Optimal threshold: {best_thresh:.3f}")
@@ -768,10 +830,12 @@ def save_metrics_report(fold_metrics, ensemble_metrics, n_total, output_path,
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _run_ablation_study(
-    X_cv: np.ndarray,
+    X_global_cv: np.ndarray,
+    X_local_cv: np.ndarray,
     y_cv: np.ndarray,
     groups_cv: np.ndarray,
-    X_test: np.ndarray,
+    X_global_test: np.ndarray,
+    X_local_test: np.ndarray,
     y_test: np.ndarray,
     kepid_test: np.ndarray,
     kepoi_test: np.ndarray,
@@ -811,7 +875,7 @@ def _run_ablation_study(
         fold_models_ab = []
 
         for fold_idx, (train_idx, val_idx) in enumerate(
-            sgkf.split(X_cv, y_cv, groups=groups_cv)
+            sgkf.split(X_global_cv, y_cv, groups=groups_cv)
         ):
             # Leakage check — same guarantee as the combined loop
             train_kps_ab = set(groups_cv[train_idx])
@@ -821,31 +885,45 @@ def _run_ablation_study(
 
             model_ab = model_builder()
 
-            # Build augmented sequence with custom input splitter
+            # Build augmented sequence with overridden input splitter.
+            # X_global is augmented; X_local is passed through unchanged.
             class _AblationSeq(Sequence):
                 """Augmented sequence for ablation with overridden input split."""
-                def __init__(self, X, y, batch_size, shuffle, splitter):
-                    self.X = X; self.y = y; self.batch_size = batch_size
+                def __init__(self, Xg, Xl, y, batch_size, shuffle, splitter):
+                    self.Xg = Xg; self.Xl = Xl; self.y = y
+                    self.batch_size = batch_size
                     self.shuffle = shuffle; self.splitter = splitter
-                    self.indices = np.arange(len(X)); self.on_epoch_end()
-                def __len__(self): return len(self.X) // self.batch_size
+                    self.indices = np.arange(len(Xg)); self.on_epoch_end()
+
+                def __len__(self):
+                    return len(self.Xg) // self.batch_size
+
                 def on_epoch_end(self):
-                    if self.shuffle: np.random.shuffle(self.indices)
+                    if self.shuffle:
+                        np.random.shuffle(self.indices)
+
                 def __getitem__(self, idx):
-                    bidx = self.indices[idx*self.batch_size:(idx+1)*self.batch_size]
-                    Xb = self.X[bidx].copy(); yb = self.y[bidx]
-                    for i in range(len(Xb)):
+                    bidx = self.indices[idx * self.batch_size:(idx + 1) * self.batch_size]
+                    Xg_b = self.Xg[bidx].copy()   # augment global branch
+                    Xl_b = self.Xl[bidx]           # local branch unchanged
+                    yb   = self.y[bidx]
+                    for i in range(len(Xg_b)):
                         shift = np.random.randint(-20, 21)
-                        Xb[i] = np.roll(Xb[i], shift, axis=0)
-                        Xb[i, :, 0] += np.random.normal(0, 0.02, NUM_BINS).astype(np.float32)
-                        Xb[i, :, 0] *= np.random.uniform(0.95, 1.05)
-                    return self.splitter(Xb), yb
+                        Xg_b[i] = np.roll(Xg_b[i], shift, axis=0)
+                        Xg_b[i, :, 0] += np.random.normal(
+                            0, 0.02, NUM_BINS).astype(np.float32)
+                        Xg_b[i, :, 0] *= np.random.uniform(0.95, 1.05)
+                    return self.splitter(Xg_b, Xl_b), yb
 
             train_gen_ab = _AblationSeq(
-                X_cv[train_idx], y_cv[train_idx], BATCH_SIZE,
-                shuffle=True, splitter=input_splitter
+                X_global_cv[train_idx], X_local_cv[train_idx],
+                y_cv[train_idx], BATCH_SIZE, shuffle=True,
+                splitter=input_splitter,
             )
-            val_data_ab = (input_splitter(X_cv[val_idx]), y_cv[val_idx])
+            val_data_ab = (
+                input_splitter(X_global_cv[val_idx], X_local_cv[val_idx]),
+                y_cv[val_idx],
+            )
 
             callbacks_ab = [
                 LearningRateScheduler(warmup_schedule, verbose=0),
@@ -868,10 +946,10 @@ def _run_ablation_study(
             fold_models_ab.append(model_ab)
 
         # Ensemble test scores
-        test_probs_ab = np.zeros(len(X_test))
+        test_probs_ab = np.zeros(len(X_global_test))
         for m_ab in fold_models_ab:
             test_probs_ab += m_ab.predict(
-                input_splitter(X_test), verbose=0, batch_size=64
+                input_splitter(X_global_test, X_local_test), verbose=0, batch_size=64
             ).flatten()
             tf.keras.backend.clear_session()
         test_probs_ab /= N_FOLDS
@@ -901,7 +979,7 @@ def _train_and_eval_one_csv(csv_path: str) -> None:
     basename = os.path.basename(csv_path)
     tag = basename.replace("kepler_training_data_", "").replace(".csv", "")
 
-    X, y, kepid_arr, fp_subtype_arr, n_total = load_and_preprocess(csv_path)
+    X_global, X_local, y, kepid_arr, fp_subtype_arr, n_total = load_and_preprocess(csv_path)
 
     # ── Held-out test set: 20% of unique kepids, stratified by label ──────────
     unique_kepids = np.unique(kepid_arr)
@@ -914,7 +992,7 @@ def _train_and_eval_one_csv(csv_path: str) -> None:
 
     sss = StratifiedShuffleSplit(n_splits=1, test_size=TEST_FRAC, random_state=RANDOM_SEED)
     cv_kepids_idx, test_kepids_idx = next(sss.split(unique_kepids, kepid_labels_arr))
-    cv_kepids  = set(unique_kepids[cv_kepids_idx])
+    cv_kepids   = set(unique_kepids[cv_kepids_idx])
     test_kepids = set(unique_kepids[test_kepids_idx])
 
     # Assert no leakage — a kepid must not appear on both sides
@@ -924,8 +1002,15 @@ def _train_and_eval_one_csv(csv_path: str) -> None:
     cv_mask   = np.array([kp in cv_kepids   for kp in kepid_arr])
     test_mask = np.array([kp in test_kepids for kp in kepid_arr])
 
-    X_cv,   y_cv,   groups_cv   = X[cv_mask],   y[cv_mask],   kepid_arr[cv_mask]
-    X_test, y_test, kepid_test  = X[test_mask],  y[test_mask],  kepid_arr[test_mask]
+    X_global_cv   = X_global[cv_mask]
+    X_local_cv    = X_local[cv_mask]
+    y_cv          = y[cv_mask]
+    groups_cv     = kepid_arr[cv_mask]
+
+    X_global_test = X_global[test_mask]
+    X_local_test  = X_local[test_mask]
+    y_test        = y[test_mask]
+    kepid_test    = kepid_arr[test_mask]
     fp_subtype_test = fp_subtype_arr[test_mask]
 
     print(f"\nCV set:   {cv_mask.sum()} examples, {len(cv_kepids)} unique KIC")
@@ -937,7 +1022,7 @@ def _train_and_eval_one_csv(csv_path: str) -> None:
     fold_models  = []
     all_cms      = []
 
-    # Collect OOF predictions for threshold optimisation (Fix 6: prevent leakage)
+    # Collect OOF predictions for threshold optimisation (prevent leakage)
     oof_true  = []
     oof_probs = []
 
@@ -946,7 +1031,7 @@ def _train_and_eval_one_csv(csv_path: str) -> None:
     print("-" * 67)
 
     for fold_idx, (train_idx, val_idx) in enumerate(
-        sgkf.split(X_cv, y_cv, groups=groups_cv)
+        sgkf.split(X_global_cv, y_cv, groups=groups_cv)
     ):
         # Runtime leakage check: no kepid in both train and val
         train_kepids = set(groups_cv[train_idx])
@@ -958,10 +1043,15 @@ def _train_and_eval_one_csv(csv_path: str) -> None:
               f"(train: {len(train_idx)}  val: {len(val_idx)}  "
               f"val_kic: {len(val_kepids)})")
 
-        model   = train_fold(X_cv[train_idx], y_cv[train_idx],
-                             X_cv[val_idx],   y_cv[val_idx])
+        model = train_fold(
+            X_global_cv[train_idx], y_cv[train_idx],
+            X_global_cv[val_idx],   y_cv[val_idx],
+            X_local_cv[train_idx],  X_local_cv[val_idx],
+        )
         # evaluate_fold returns (metrics_dict, y_prob) — y_prob for OOF collection
-        metrics, y_prob_val = evaluate_fold(model, X_cv[val_idx], y_cv[val_idx])
+        metrics, y_prob_val = evaluate_fold(
+            model, X_global_cv[val_idx], X_local_cv[val_idx], y_cv[val_idx]
+        )
         fold_metrics.append(metrics)
         fold_models.append(model)
         all_cms.append(metrics["confusion_matrix"])
@@ -982,11 +1072,11 @@ def _train_and_eval_one_csv(csv_path: str) -> None:
     print(f"\nOOF threshold (from {len(oof_y)} OOF predictions): {cv_threshold:.3f}")
 
     # ── Ensemble inference on held-out test set ───────────────────────────────
-    print(f"\nComputing ensemble scores on held-out test set ({len(X_test)} examples)...")
-    test_probs = np.zeros(len(X_test))
+    print(f"\nComputing ensemble scores on held-out test set ({len(X_global_test)} examples)...")
+    test_probs = np.zeros(len(X_global_test))
     for fold_model in fold_models:
         test_probs += fold_model.predict(
-            split_inputs(X_test), verbose=0, batch_size=64
+            split_inputs(X_global_test, X_local_test), verbose=0, batch_size=64
         ).flatten()
         tf.keras.backend.clear_session()
     test_probs /= N_FOLDS
@@ -1050,8 +1140,9 @@ def _train_and_eval_one_csv(csv_path: str) -> None:
     if tag.endswith("psf0"):
         print(f"\n  Running ablation study for {tag} ...")
         _run_ablation_study(
-            X_cv, y_cv, groups_cv,
-            X_test, y_test, kepid_test, kepoi_test, fp_subtype_test,
+            X_global_cv, X_local_cv, y_cv, groups_cv,
+            X_global_test, X_local_test, y_test,
+            kepid_test, kepoi_test, fp_subtype_test,
             tag,
         )
 
