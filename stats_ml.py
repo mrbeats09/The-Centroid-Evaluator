@@ -1,7 +1,7 @@
 """
 stats_ml.py — Bootstrap Statistics and Breakdown Resolution
 
-Reads per-target CNN scores from results_resolution/scores_k{K}_psf{P}.csv
+Reads per-target CNN scores from results_resolution/k{K}_psf{P}/scores_k{K}_psf{P}.csv
 and computes ROC-AUC with bootstrap 95% CIs for each (k, PSF setting).
 
 Primary uncertainty quantification: bootstrap CIs by resampling targets.
@@ -213,7 +213,7 @@ def load_all_scores(results_dir: str) -> dict[tuple[int, int], pd.DataFrame]:
     Excludes ablation files (*_flux_only.csv, *_centroid_only.csv).
     Returns dict keyed by (k, psf).
     """
-    pattern = os.path.join(results_dir, "scores_k*_psf*.csv")
+    pattern = os.path.join(results_dir, "k*_psf*", "scores_k*_psf*.csv")
     files = sorted(glob.glob(pattern))
     if not files:
         print(f"No score files found matching {pattern}")
