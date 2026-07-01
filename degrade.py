@@ -51,6 +51,15 @@ from scipy.stats import pearsonr
 
 KEPLER_PIXEL_SCALE_ARCSEC = 3.98  # arcsec per native pixel
 
+# Aperture-degeneracy gate: a superpixel grid this small (or an aperture that collapses
+# to this few True superpixels after rebinning) has too few positional degrees of freedom
+# to produce a meaningful centroid measurement. Near-zero scatter from such a grid is a
+# measurement-collapse artefact, not evidence of improved precision. Thresholds grounded
+# in a live diagnostic over 1,500 native Kepler TPFs (median native stamp ~5x6 px, median
+# native aperture ~6 px) — see results_resolution/aperture_diagnostics.csv once populated.
+MIN_GRID_DIM = 2               # coarse grid must be >= 2x2 to be non-degenerate
+MIN_APERTURE_SUPERPIXELS = 2   # coarse aperture must contain >= 2 True superpixels
+
 
 # ============================================================================
 # TPF loading
@@ -143,7 +152,7 @@ def superpixel_rebin(
     cube: np.ndarray,
     aperture: np.ndarray,
     k: int,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[Optional[np.ndarray], Optional[np.ndarray], dict]:
     """
     Bin the (ny, nx) pixel grid into k×k superpixels by SUMMING values.
     Summation preserves photon counts and therefore the SNR scaling
@@ -151,34 +160,77 @@ def superpixel_rebin(
 
     Edge pixels are cropped so that ny and nx are both divisible by k.
 
+    Degeneracy gate: if the resulting grid has fewer than MIN_GRID_DIM
+    superpixels in either dimension, or the rebinned aperture contains fewer
+    than MIN_APERTURE_SUPERPIXELS True superpixels, the rebinning is flagged
+    as degenerate. A centroid computed from a grid this small has too few
+    positional degrees of freedom to produce a meaningful measurement — the
+    resulting near-zero scatter is a measurement-collapse artefact, not
+    evidence of improved precision. Two tiers are distinguished:
+      - "hard" (ny_out or nx_out == 0): the grid is literally empty in one
+        dimension; no array can be constructed at all.
+      - "soft": a valid (if tiny/uninformative) grid exists.
+
     Args:
         cube:     (n_cad, ny, nx) float32
         aperture: (ny, nx) bool pipeline mask
-        k:        binning factor ≥1
+        k:        binning factor >=1 (k==1 is the identity case, handled here
+                  so callers never need to branch on k==1 vs k>1)
 
     Returns:
-        coarse_cube:     (n_cad, ny//k, nx//k) float32
-        coarse_aperture: (ny//k, nx//k) bool — True if any native pixel in
-                         the superpixel was in the original aperture
+        coarse_cube:     (n_cad, ny_out, nx_out) float32, or None if hard-degenerate
+        coarse_aperture: (ny_out, nx_out) bool, or None if hard-degenerate — True if
+                         any native pixel in the superpixel was in the original aperture
+        degeneracy: dict with keys
+            ny_out, nx_out             — coarse grid dimensions
+            hard_degenerate            — bool, grid collapsed to empty in a dimension
+            aperture_superpixels       — int, True count in coarse_aper (0 if hard)
+            soft_degenerate            — bool, grid/aperture below MIN_* thresholds
     """
-    if k == 1:
-        return cube, aperture
-
     n_cad, ny, nx = cube.shape
-    ny_crop = (ny // k) * k
-    nx_crop = (nx // k) * k
 
-    cube_crop = cube[:, :ny_crop, :nx_crop]
-    aper_crop = aperture[:ny_crop, :nx_crop]
+    if k == 1:
+        ny_out, nx_out = ny, nx
+    else:
+        ny_out, nx_out = ny // k, nx // k
 
-    # Reshape to (..., ny//k, k, nx//k, k) then sum over the k-sized axes
-    ny_out = ny_crop // k
-    nx_out = nx_crop // k
+    hard_degenerate = (ny_out == 0 or nx_out == 0)
+    if hard_degenerate:
+        degeneracy = {
+            "ny_out": ny_out,
+            "nx_out": nx_out,
+            "hard_degenerate": True,
+            "aperture_superpixels": 0,
+            "soft_degenerate": False,
+        }
+        return None, None, degeneracy
 
-    coarse = cube_crop.reshape(n_cad, ny_out, k, nx_out, k).sum(axis=(2, 4))
-    coarse_aper = aper_crop.reshape(ny_out, k, nx_out, k).any(axis=(1, 3))
+    if k == 1:
+        coarse, coarse_aper = cube, aperture
+    else:
+        ny_crop = ny_out * k
+        nx_crop = nx_out * k
+        cube_crop = cube[:, :ny_crop, :nx_crop]
+        aper_crop = aperture[:ny_crop, :nx_crop]
+        # Reshape to (..., ny//k, k, nx//k, k) then sum over the k-sized axes
+        coarse = cube_crop.reshape(n_cad, ny_out, k, nx_out, k).sum(axis=(2, 4))
+        coarse_aper = aper_crop.reshape(ny_out, k, nx_out, k).any(axis=(1, 3))
 
-    return coarse, coarse_aper
+    aperture_superpixels = int(coarse_aper.sum())
+    soft_degenerate = (
+        ny_out < MIN_GRID_DIM
+        or nx_out < MIN_GRID_DIM
+        or aperture_superpixels < MIN_APERTURE_SUPERPIXELS
+    )
+
+    degeneracy = {
+        "ny_out": ny_out,
+        "nx_out": nx_out,
+        "hard_degenerate": False,
+        "aperture_superpixels": aperture_superpixels,
+        "soft_degenerate": soft_degenerate,
+    }
+    return coarse, coarse_aper, degeneracy
 
 
 # ============================================================================
@@ -380,15 +432,22 @@ def compute_centroid_quality(
     offset_arcsec: float,
     uncertainty_arcsec: float,
     oot_mask: np.ndarray,
+    k: int,
 ) -> dict:
     """
     Compute aggregate centroid quality metrics for one target.
 
     Args:
-        m1, m2:             moment centroid time series (superpixel units)
+        m1, m2:             moment centroid time series (superpixel-index units at scale k)
         offset_arcsec:      median diff-image offset (arcsec)
         uncertainty_arcsec: median diff-image uncertainty (arcsec)
         oot_mask:           bool array marking OOT cadences
+        k:                  degradation factor — m1/m2 are in units of superpixel
+                             indices, and each superpixel spans k native pixels, so
+                             converting their scatter to arcsec requires multiplying
+                             by k * KEPLER_PIXEL_SCALE_ARCSEC, not the bare native
+                             constant (matches difference_image_centroid's own
+                             pixel_scale_arcsec = KEPLER_PIXEL_SCALE_ARCSEC * k).
 
     Returns dict:
         centroid_rms       — RMS of OOT centroid displacement (arcsec)
@@ -398,10 +457,11 @@ def compute_centroid_quality(
     """
     oot_m1 = m1[oot_mask]
     oot_m2 = m2[oot_mask]
+    pixel_scale_arcsec = KEPLER_PIXEL_SCALE_ARCSEC * k
 
     if len(oot_m1) >= 2:
-        rms_m1 = float(np.nanstd(oot_m1)) * KEPLER_PIXEL_SCALE_ARCSEC
-        rms_m2 = float(np.nanstd(oot_m2)) * KEPLER_PIXEL_SCALE_ARCSEC
+        rms_m1 = float(np.nanstd(oot_m1)) * pixel_scale_arcsec
+        rms_m2 = float(np.nanstd(oot_m2)) * pixel_scale_arcsec
         centroid_rms = math.sqrt(rms_m1 ** 2 + rms_m2 ** 2)
     else:
         centroid_rms = np.nan

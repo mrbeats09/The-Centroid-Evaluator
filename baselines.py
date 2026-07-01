@@ -192,8 +192,13 @@ def compute_bryson_scores(
                     data = np.load(path)
                     offset      = float(data.get("offset_arcsec",       np.nan))
                     uncertainty = float(data.get("centroid_uncertainty", np.nan))
+                    is_degenerate = bool(data["quality_degenerate"]) if "quality_degenerate" in data else False
 
-                    if np.isfinite(uncertainty) and uncertainty > 0:
+                    if is_degenerate:
+                        # Grid too small to trust — dividing by its near-zero variance
+                        # is exactly what produces the misleading SNR spikes.
+                        score = np.nan
+                    elif np.isfinite(uncertainty) and uncertainty > 0:
                         score = abs(offset) / uncertainty
                     else:
                         score = np.nan
@@ -264,8 +269,13 @@ def compute_bryson_binary_scores(
                     data = np.load(path)
                     offset      = float(data.get("offset_arcsec",       np.nan))
                     uncertainty = float(data.get("centroid_uncertainty", np.nan))
+                    is_degenerate = bool(data["quality_degenerate"]) if "quality_degenerate" in data else False
 
-                    if np.isfinite(uncertainty) and uncertainty > 0:
+                    if is_degenerate:
+                        # Grid too small to trust — dividing by its near-zero variance
+                        # is exactly what produces the misleading SNR spikes.
+                        snr = np.nan
+                    elif np.isfinite(uncertainty) and uncertainty > 0:
                         snr = abs(offset) / uncertainty
                     else:
                         snr = np.nan
@@ -392,13 +402,12 @@ def run_vetting_baseline(
                             if cube is None:
                                 continue
 
-                            if k > 1:
-                                coarse, coarse_aper = superpixel_rebin(cube, aperture, k)
-                            else:
-                                coarse, coarse_aper = cube, aperture
+                            coarse, coarse_aper, _degeneracy = superpixel_rebin(cube, aperture, k)
 
-                            # Pixel degeneracy check: vetting needs at least a 3×3 aperture
-                            ny_c, nx_c = coarse.shape[1], coarse.shape[2]
+                            # Pixel degeneracy check: vetting needs at least a 3×3 aperture.
+                            # Read dims from the degeneracy dict (not coarse.shape) since
+                            # coarse is None when superpixel_rebin reports hard_degenerate.
+                            ny_c, nx_c = _degeneracy["ny_out"], _degeneracy["nx_out"]
                             if ny_c < 3 or nx_c < 3:
                                 log_vetting_failure(
                                     f"KIC {kepid} k={k} q={getattr(tpf,'quarter','?')}: "

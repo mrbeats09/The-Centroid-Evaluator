@@ -97,6 +97,12 @@ def log_failure(path: str, msg: str) -> None:
         f.write(msg + "\n")
 
 
+def _log_aperture_diagnostic(path: str, row: dict) -> None:
+    """Append one row to aperture_diagnostics.csv; write header only if the file is new."""
+    header = not os.path.exists(path)
+    pd.DataFrame([row]).to_csv(path, mode="a", index=False, header=header)
+
+
 # ============================================================================
 # Local TPF loader — no MAST re-query during cache build
 # ============================================================================
@@ -855,6 +861,7 @@ def build_cache(
     cache_dir: str,
     k_values: list[int],
     max_quarters: int | None,
+    results_dir: str = "results_resolution",
 ) -> None:
     """
     Load TPFs for each kepid from the local filesystem (no MAST re-query),
@@ -868,8 +875,10 @@ def build_cache(
     ephemeris as a representative proxy).
 
     Stale-cache detection: if existing flux cache files were built with the old
-    NUM_BINS (1000-bin schema), this function emits a clear error and exits. The
-    user must manually delete cache/flux/ and cache/centroids/ before re-running.
+    NUM_BINS (1000-bin schema), or existing centroid cache files predate the
+    aperture-degeneracy gate (missing the 'quality_degenerate' key), this function
+    emits a clear error and exits. The user must manually delete cache/flux/ and/or
+    cache/centroids/ before re-running.
     """
     try:
         from degrade import (
@@ -908,6 +917,36 @@ def build_cache(
                 sys.exit(1)
         except Exception:
             pass  # Unreadable probe: proceed; corrupt cache will surface later
+
+    # ── Stale centroid-cache guard ───────────────────────────────────────────
+    # Detect centroid cache files built before the aperture-degeneracy gate
+    # (superpixel_rebin previously had no size check at all, so any existing
+    # cache/centroids/*.npz predating this fix is known-corrupted at high k —
+    # e.g. centroid_scaling.csv showing median_uncertainty/median_rms == 0.0
+    # exactly at k=4/k=5). Detect via the presence of the new 'quality_degenerate'
+    # key, which every post-fix write includes.
+    centroid_npz_candidates = [f for f in os.listdir(centroid_dir) if f.endswith(".npz")]
+    if centroid_npz_candidates:
+        try:
+            probe = np.load(os.path.join(centroid_dir, centroid_npz_candidates[0]))
+            if "quality_degenerate" not in probe.files:
+                print(
+                    "\nERROR: Stale centroid cache detected — missing 'quality_degenerate' key.\n"
+                    "Existing cache/centroids/*.npz files were built before the aperture-degeneracy "
+                    "fix and are known-corrupted at high k (see centroid_scaling.csv medians of "
+                    "exactly 0.0 at k=4/k=5).\n"
+                    "Action required: delete cache/centroids/ (NOT cache/flux/, which is unaffected "
+                    "by this bug) and re-run '--phase cache'."
+                )
+                sys.exit(1)
+        except Exception as exc:
+            print(f"WARNING: could not probe centroid cache ({type(exc).__name__}: {exc}); "
+                  f"proceeding — corrupt cache will surface later.")
+
+    os.makedirs(results_dir, exist_ok=True)
+    aperture_diag_path = os.path.join(results_dir, "aperture_diagnostics.csv")
+    if os.path.exists(aperture_diag_path):
+        os.remove(aperture_diag_path)
 
     unique_kepids = manifest["kepid"].unique()
     koi_by_kepid = manifest.groupby("kepid")
@@ -963,6 +1002,7 @@ def build_cache(
 
     # Full cache build
     print(f"\nBuilding cache for k = {k_values} × PSF {{off, on}}...")
+    build_stats: dict = {}
     for kepid in tqdm(unique_kepids, desc="Building cache", unit="target"):
         rows = koi_by_kepid.get_group(kepid)
         try:
@@ -983,18 +1023,37 @@ def build_cache(
                 for psf in [0, 1]:
                     out_path = os.path.join(centroid_dir,
                                             f"{kepid}_k{k}_psf{psf}.npz")
+                    stats = build_stats.setdefault(
+                        (k, psf), {"n_targets": 0, "n_hard_excluded": 0, "n_quality_degenerate": 0}
+                    )
                     if os.path.exists(out_path):
                         continue
-                    _compute_centroid_cache(
-                        kepid, tpf_list, rows, k, psf, out_path,
+                    status = _compute_centroid_cache(
+                        kepid, tpf_list, rows, k, psf, out_path, results_dir,
                         load_cube, superpixel_rebin, psf_broaden,
                         moment_centroid, difference_image_centroid,
                         compute_centroid_quality,
                     )
+                    stats["n_targets"] += 1
+                    if not status["written"]:
+                        stats["n_hard_excluded"] += 1
+                    elif status["quality_degenerate"]:
+                        stats["n_quality_degenerate"] += 1
 
         except Exception as exc:
             log_failure("failed_targets.log",
                         f"KIC {kepid}: cache build: {type(exc).__name__}: {exc}")
+
+    if build_stats:
+        print("\nAperture-degeneracy exclusion summary (per k, psf):")
+        print(f"  {'k':>4} {'psf':>4} {'n_targets':>10} {'hard_excl':>16} {'quality_degenerate':>20}")
+        for (k, psf), s in sorted(build_stats.items()):
+            n = s["n_targets"]
+            if n == 0:
+                continue
+            hard_str = f"{s['n_hard_excluded']} ({s['n_hard_excluded']/n:.1%})"
+            deg_str = f"{s['n_quality_degenerate']} ({s['n_quality_degenerate']/n:.1%})"
+            print(f"  {k:>4} {psf:>4} {n:>10} {hard_str:>16} {deg_str:>20}")
 
     print("Phase 2 complete.")
 
@@ -1237,11 +1296,11 @@ def _get_k1_uncertainty(cube, time, quality, aperture, period, t0_bkjd, dur_days
 
 def _compute_centroid_cache(
     kepid, tpf_list, koi_rows, k, psf,
-    out_path,
+    out_path, results_dir,
     load_cube, superpixel_rebin, psf_broaden,
     moment_centroid, difference_image_centroid,
     compute_centroid_quality,
-) -> None:
+) -> dict:
     """
     Compute centroid time series and quality metrics at scale k for this kepid.
     Writes cache/centroids/{kepid}_k{k}_psf{psf}.npz.
@@ -1256,6 +1315,30 @@ def _compute_centroid_cache(
     of other planets on the same star.
 
     koi_time0bk is in BKJD — use directly; do NOT subtract 2457000 (TESS offset).
+
+    Two-tier aperture-degeneracy handling (see superpixel_rebin in degrade.py):
+      - hard-degenerate quarter (grid collapsed to empty in a dimension): the
+        quarter contributes nothing at all — no array exists to build a centroid
+        from. If every quarter for this target is hard-degenerate, no cache file
+        is written (matches how a missing cache file already excludes a kepid
+        from write_training_csvs).
+      - soft-degenerate quarter (grid/aperture exists but is too small to trust):
+        m1/m2 ARE concatenated (a real, if flat/uninformative, signal — legitimate
+        input for the CNN), but difference_image_centroid is NOT called for that
+        quarter, since its offset/uncertainty would come from a near-zero-variance
+        grid and would corrupt the aggregate Bryson/quality statistics.
+      - quality_degenerate (whole-target flag, written to the npz) is True if ANY
+        contributing quarter was soft-degenerate, because compute_centroid_quality's
+        centroid_rms is computed over the ENTIRE concatenated m1/m2 array across all
+        quarters, not per-quarter — a single soft-degenerate quarter's near-zero
+        samples would contaminate that whole-target statistic even if other quarters
+        were clean. This is a conservative choice: it may occasionally discard an
+        otherwise-good target's Bryson/quality data because of one bad quarter, but
+        never lets a contaminated statistic through as trusted.
+
+    Returns:
+        dict with keys "written" (bool, whether a cache file was written) and
+        "quality_degenerate" (bool | None, None if no file was written).
     """
     row = koi_rows.iloc[0]
     period = float(row["koi_period"])
@@ -1264,8 +1347,10 @@ def _compute_centroid_cache(
 
     m1_parts, m2_parts, time_parts = [], [], []
     diff_offsets, diff_uncertainties = [], []
+    any_quarter_soft = False
+    aperture_diag_path = os.path.join(results_dir, "aperture_diagnostics.csv")
 
-    for tpf in tpf_list:
+    for q_idx, tpf in enumerate(tpf_list):
         try:
             cube, time, quality, wcs, aperture = load_cube(tpf)
             if cube is None or len(time) == 0:
@@ -1275,27 +1360,63 @@ def _compute_centroid_cache(
             if psf == 1 and k > 1:
                 cube = np.stack([psf_broaden(frame, k) for frame in cube])
 
-            # Superpixel rebinning (k=1 is identity)
-            if k > 1:
-                coarse_cube, coarse_aperture = superpixel_rebin(cube, aperture, k)
-            else:
-                coarse_cube, coarse_aperture = cube, aperture
+            ny_native, nx_native = cube.shape[1], cube.shape[2]
+            aper_native = int(aperture.sum())
 
-            # Moment centroid time series
+            coarse_cube, coarse_aperture, degeneracy = superpixel_rebin(cube, aperture, k)
+
+            _log_aperture_diagnostic(aperture_diag_path, {
+                "kepid": kepid, "k": k, "psf": psf,
+                "quarter_index": q_idx, "quarter": getattr(tpf, "quarter", "?"),
+                "ny_native": ny_native, "nx_native": nx_native,
+                "aperture_superpixels_native": aper_native,
+                "ny_out": degeneracy["ny_out"], "nx_out": degeneracy["nx_out"],
+                "aperture_superpixels_coarse": degeneracy["aperture_superpixels"],
+                "degeneracy_tier": (
+                    "hard" if degeneracy["hard_degenerate"]
+                    else "soft" if degeneracy["soft_degenerate"]
+                    else "none"
+                ),
+            })
+
+            if degeneracy["hard_degenerate"]:
+                log_failure(
+                    "degenerate_aperture.log",
+                    f"KIC {kepid} k={k} psf={psf} quarter={getattr(tpf, 'quarter', '?')}: "
+                    f"HARD degenerate ({degeneracy['ny_out']}x{degeneracy['nx_out']}) "
+                    f"— quarter excluded entirely"
+                )
+                continue
+
+            quarter_soft = degeneracy["soft_degenerate"]
+            if quarter_soft:
+                any_quarter_soft = True
+                log_failure(
+                    "degenerate_aperture.log",
+                    f"KIC {kepid} k={k} psf={psf} quarter={getattr(tpf, 'quarter', '?')}: "
+                    f"SOFT degenerate (grid {degeneracy['ny_out']}x{degeneracy['nx_out']}, "
+                    f"aperture_superpixels={degeneracy['aperture_superpixels']}) "
+                    f"— quarter's diff-image stats excluded, m1/m2 retained"
+                )
+
+            # Moment centroid time series — real (if flat) signal even when soft-degenerate
             m1, m2 = moment_centroid(coarse_cube, coarse_aperture)
 
-            # Difference-image centroid offset
-            diff_result = difference_image_centroid(
-                coarse_cube, time, period, t0_bkjd, dur_days, k=k
-            )
+            if not quarter_soft:
+                # Difference-image centroid offset — skipped for soft-degenerate quarters,
+                # since a near-zero-variance grid would produce a misleadingly precise
+                # offset/uncertainty that contaminates the aggregate Bryson statistic.
+                diff_result = difference_image_centroid(
+                    coarse_cube, time, period, t0_bkjd, dur_days, k=k
+                )
+                if diff_result.get("offset_arcsec") is not None:
+                    diff_offsets.append(diff_result["offset_arcsec"])
+                if diff_result.get("uncertainty_arcsec") is not None:
+                    diff_uncertainties.append(diff_result["uncertainty_arcsec"])
 
             time_parts.append(time)
             m1_parts.append(m1)
             m2_parts.append(m2)
-            if diff_result.get("offset_arcsec") is not None:
-                diff_offsets.append(diff_result["offset_arcsec"])
-            if diff_result.get("uncertainty_arcsec") is not None:
-                diff_uncertainties.append(diff_result["uncertainty_arcsec"])
 
         except Exception as exc:
             log_failure("failed_targets.log",
@@ -1303,7 +1424,7 @@ def _compute_centroid_cache(
             continue
 
     if not time_parts:
-        return
+        return {"written": False, "quality_degenerate": None}
 
     time_arr = np.concatenate(time_parts)
     m1_arr = np.concatenate(m1_parts)
@@ -1337,14 +1458,21 @@ def _compute_centroid_cache(
             f"MASK: KIC {kepid} k={k} psf={psf}: insufficient OOT cadences "
             f"({oot_mask.sum()}) after multi-planet mask — skipped",
         )
-        return
+        return {"written": False, "quality_degenerate": None}
 
     # Compute quality metrics
     offset_median = float(np.median(diff_offsets)) if diff_offsets else np.nan
     uncertainty_median = float(np.median(diff_uncertainties)) if diff_uncertainties else np.nan
     quality_metrics = compute_centroid_quality(
-        m1_arr, m2_arr, offset_median, uncertainty_median, oot_mask
+        m1_arr, m2_arr, offset_median, uncertainty_median, oot_mask, k=k
     )
+
+    quality_degenerate = any_quarter_soft
+    if quality_degenerate:
+        # Belt: force NaN at write time so any downstream code path that forgets to
+        # check the quality_degenerate flag still sees NaN, not a misleadingly-precise
+        # number (e.g. an exact 0.0 that would otherwise pass an isfinite() check).
+        quality_metrics = {key: np.float32(np.nan) for key in quality_metrics}
 
     np.savez_compressed(
         out_path,
@@ -1355,8 +1483,10 @@ def _compute_centroid_cache(
         oot_mask=oot_mask,
         diff_offset_arcsec=np.array(diff_offsets) if diff_offsets else np.array([np.nan]),
         diff_uncertainty_arcsec=np.array(diff_uncertainties) if diff_uncertainties else np.array([np.nan]),
+        quality_degenerate=np.bool_(quality_degenerate),
         **quality_metrics,
     )
+    return {"written": True, "quality_degenerate": quality_degenerate}
 
 
 # ============================================================================
@@ -1638,6 +1768,38 @@ def write_data_attrition_report(
 
     lines += [
         "",
+        "Degenerate-aperture exclusions per (k, psf):",
+    ]
+    aperture_diag_path = os.path.join(results_dir, "aperture_diagnostics.csv")
+    if os.path.exists(aperture_diag_path):
+        diag = pd.read_csv(aperture_diag_path)
+        for k in k_values:
+            for psf in [0, 1]:
+                sub = diag[(diag["k"] == k) & (diag["psf"] == psf)]
+                if sub.empty:
+                    continue
+                n_hard = int((sub["degeneracy_tier"] == "hard").sum())
+                n_soft = int((sub["degeneracy_tier"] == "soft").sum())
+                n_q = len(sub)
+                lines.append(
+                    f"  k={k} psf={psf}: {n_hard:>6,}/{n_q:,} quarters hard-excluded, "
+                    f"{n_soft:>6,}/{n_q:,} quarters soft-flagged (quality metrics only)"
+                )
+        lines.append("  Targets losing ALL centroid data (no cache file written) per (k, psf):")
+        centroid_dir_ = os.path.join(cache_dir, "centroids")
+        n_kic_total = manifest["kepid"].nunique()
+        for k in k_values:
+            for psf in [0, 1]:
+                n_missing = sum(
+                    1 for kepid in manifest["kepid"].unique()
+                    if not os.path.exists(os.path.join(centroid_dir_, f"{kepid}_k{k}_psf{psf}.npz"))
+                )
+                lines.append(f"    k={k} psf={psf}: {n_missing:,} / {n_kic_total:,} targets")
+    else:
+        lines.append("  (aperture_diagnostics.csv not found — run --phase cache to generate)")
+
+    lines += [
+        "",
         "=" * 60,
     ]
 
@@ -1727,7 +1889,7 @@ def main():
 
     # Clear log files at the start of a fresh run (download phase only)
     if args.phase in ("download", "all"):
-        for log in ["failed_targets.log", "sparse_targets.log"]:
+        for log in ["failed_targets.log", "sparse_targets.log", "degenerate_aperture.log"]:
             open(log, "w").close()
 
     warnings.filterwarnings("ignore")
@@ -1751,7 +1913,7 @@ def main():
         )
 
     if run_cache:
-        build_cache(manifest, tpf_dir, cache_dir, args.k_values, args.max_quarters)
+        build_cache(manifest, tpf_dir, cache_dir, args.k_values, args.max_quarters, args.results_dir)
 
     csv_counts = {}
     if run_csv:

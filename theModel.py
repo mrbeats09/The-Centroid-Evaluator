@@ -26,7 +26,7 @@ Changes from the prior TESS version:
   - Ensemble threshold fixed from OOF CV predictions (not test-set optimised)
   - Outer loop over per-k training CSVs (kepler_training_data_k{K}_psf{P}.csv)
   - Per-k test scores saved to results_resolution/k{K}_psf{P}/scores_k{K}_psf{P}.csv
-  - Ablation study (flux-only, centroid-only) — ARCHIVED, see Section 9
+  - Ablation study (flux-only, centroid-only) — REACTIVATED, see Section 9
   - OUTPUT_DIR → results_resolution/
 
 All other code (focal loss, optimiser, LR schedule, augmentations, architecture)
@@ -223,30 +223,29 @@ def split_inputs(X_global, X_local):
     return (X_global, X_local)
 
 
-# ARCHIVED: the following ablation-study code (flux-only / centroid-only
-# variants) was originally built for a prior study that has since been
-# repurposed. It is not relevant to the current centroid-degradation study
-# goal and is disabled here to avoid its added training time. Kept for
-# reference rather than deleted.
-# def split_inputs_flux_only(X_global, X_local):
-#     """
-#     Split for flux-only ablation: global branch receives flux channel only
-#     (shape (N, 301, 1)); local branch receives the pre-computed adaptive local
-#     window (already flux-only, shape (N, 61, 1)).
-#     """
-#     return (X_global[:, :, 0:1], X_local)
-#
-#
-# def split_inputs_centroid_only(X_global, X_local):
-#     """
-#     Split for centroid-only ablation: both branches receive the full centroid
-#     sequence (ch1=RA, ch2=Dec from X_global), shape (N, 301, 2). The local
-#     branch is not used — slicing the central bins of a centroid series has no
-#     physical transit-morphology interpretation — so both input slots receive the
-#     same centroid array.
-#     """
-#     centroid = X_global[:, :, 1:3]
-#     return (centroid, centroid)
+# REACTIVATED: this ablation-study code was archived in commit 6c8ad73 and is now
+# reactivated — the modality-convergence analysis (graphs.py Graph 1/4 annotations)
+# and the Bryson-vs-centroid-only comparison (graphs.py Graph 7) both require these
+# per-k flux-only / centroid-only AUCs.
+def split_inputs_flux_only(X_global, X_local):
+    """
+    Split for flux-only ablation: global branch receives flux channel only
+    (shape (N, 301, 1)); local branch receives the pre-computed adaptive local
+    window (already flux-only, shape (N, 61, 1)).
+    """
+    return (X_global[:, :, 0:1], X_local)
+
+
+def split_inputs_centroid_only(X_global, X_local):
+    """
+    Split for centroid-only ablation: both branches receive the full centroid
+    sequence (ch1=RA, ch2=Dec from X_global), shape (N, 301, 2). The local
+    branch is not used — slicing the central bins of a centroid series has no
+    physical transit-morphology interpretation — so both input slots receive the
+    same centroid array.
+    """
+    centroid = X_global[:, :, 1:3]
+    return (centroid, centroid)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -401,151 +400,150 @@ def build_model():
     return model
 
 
-# ARCHIVED: the following ablation-study code (flux-only / centroid-only
-# variants) was originally built for a prior study that has since been
-# repurposed. It is not relevant to the current centroid-degradation study
-# goal and is disabled here to avoid its added training time. Kept for
-# reference rather than deleted.
-# def build_model_flux_only():
-#     """
-#     Flux-only ablation variant of the dual-branch CNN.
-#
-#     Removes the centroid channels entirely — both branches operate on the flux
-#     channel only (ch0). Used to establish the baseline performance achievable
-#     from transit morphology alone, with no centroid information.
-#
-#     Architecture mirrors the combined model exactly:
-#       Global: (301, 1), same pooling (4 then 5)
-#       Local:  (61,  1), same pooling (3)
-#     """
-#     # ── Global branch: full orbit, flux only ────────────────────────────────
-#     global_input = keras.Input(shape=(301, 1), name="global_input")
-#
-#     x = layers.Conv1D(32, kernel_size=5, padding="same",
-#                       kernel_regularizer=regularizers.l2(1e-4))(global_input)
-#     x = layers.BatchNormalization()(x)
-#     x = layers.Activation("relu")(x)
-#     x = layers.MaxPooling1D(pool_size=4)(x)                    # 301 → 75
-#
-#     x = layers.Conv1D(64, kernel_size=5, padding="same",
-#                       kernel_regularizer=regularizers.l2(1e-4))(x)
-#     x = layers.BatchNormalization()(x)
-#     x = layers.Activation("relu")(x)
-#     x = layers.MaxPooling1D(pool_size=5)(x)                    # 75  → 15
-#
-#     x = layers.Conv1D(128, kernel_size=5, padding="same",
-#                       kernel_regularizer=regularizers.l2(1e-4))(x)
-#     x = layers.BatchNormalization()(x)
-#     x = layers.Activation("relu")(x)
-#     global_out = layers.GlobalAveragePooling1D()(x)            # → (128,)
-#
-#     # ── Local branch: adaptive transit window, flux only ─────────────────────
-#     local_input = keras.Input(shape=(61, 1), name="local_input")
-#
-#     y = layers.Conv1D(32, kernel_size=5, padding="same",
-#                       kernel_regularizer=regularizers.l2(1e-4))(local_input)
-#     y = layers.BatchNormalization()(y)
-#     y = layers.Activation("relu")(y)
-#     y = layers.MaxPooling1D(pool_size=3)(y)                    # 61  → 20
-#
-#     y = layers.Conv1D(64, kernel_size=5, padding="same",
-#                       kernel_regularizer=regularizers.l2(1e-4))(y)
-#     y = layers.BatchNormalization()(y)
-#     y = layers.Activation("relu")(y)
-#     local_out = layers.GlobalAveragePooling1D()(y)             # → (64,)
-#
-#     # ── Classification head ───────────────────────────────────────────────────
-#     combined = layers.Concatenate()([global_out, local_out])   # → (192,)
-#
-#     z = layers.Dense(128, activation="relu",
-#                      kernel_regularizer=regularizers.l2(1e-4))(combined)
-#     z = layers.Dropout(0.5)(z)
-#     z = layers.Dense(32, activation="relu",
-#                      kernel_regularizer=regularizers.l2(1e-4))(z)
-#     z = layers.Dropout(0.5)(z)
-#     output = layers.Dense(1, activation="sigmoid")(z)
-#
-#     model = keras.Model(inputs=[global_input, local_input], outputs=output)
-#     model.compile(
-#         optimizer=keras.optimizers.Adam(learning_rate=1e-3),
-#         loss=focal_loss(gamma=2.0, alpha=0.5, smoothing=0.1),
-#         metrics=["accuracy", keras.metrics.AUC(name="auc")]
-#     )
-#     return model
-#
-#
-# def build_model_centroid_only():
-#     """
-#     Centroid-only ablation variant of the dual-branch CNN.
-#
-#     Removes the flux channel entirely — both branches operate on centroid channels
-#     (ch1=RA, ch2=Dec from X_global), shape (N, 301, 2). The local transit-window
-#     view is not used — slicing the central bins of a centroid series has no
-#     physical transit-morphology interpretation — so both input slots receive the
-#     same full centroid sequence.
-#
-#     Branch 1 (3 Conv1D blocks, 32→64→128 filters, pools 4 then 5) mirrors the
-#       combined global branch.
-#     Branch 2 (2 Conv1D blocks, 32→64 filters, pool 3) mirrors the combined local-
-#       branch architecture but on the full centroid sequence.
-#
-#     Used to isolate the contribution of centroid information alone, without transit
-#     morphology features. Performance degrades with k as centroid SNR decreases.
-#     """
-#     # ── Branch 1: full centroid sequence, 3-block architecture ──────────────
-#     global_input_1 = keras.Input(shape=(301, 2), name="global_input_1")
-#
-#     x = layers.Conv1D(32, kernel_size=5, padding="same",
-#                       kernel_regularizer=regularizers.l2(1e-4))(global_input_1)
-#     x = layers.BatchNormalization()(x)
-#     x = layers.Activation("relu")(x)
-#     x = layers.MaxPooling1D(pool_size=4)(x)                    # 301 → 75
-#
-#     x = layers.Conv1D(64, kernel_size=5, padding="same",
-#                       kernel_regularizer=regularizers.l2(1e-4))(x)
-#     x = layers.BatchNormalization()(x)
-#     x = layers.Activation("relu")(x)
-#     x = layers.MaxPooling1D(pool_size=5)(x)                    # 75  → 15
-#
-#     x = layers.Conv1D(128, kernel_size=5, padding="same",
-#                       kernel_regularizer=regularizers.l2(1e-4))(x)
-#     x = layers.BatchNormalization()(x)
-#     x = layers.Activation("relu")(x)
-#     branch1_out = layers.GlobalAveragePooling1D()(x)           # → (128,)
-#
-#     # ── Branch 2: same centroid sequence, 2-block architecture ──────────────
-#     global_input_2 = keras.Input(shape=(301, 2), name="global_input_2")
-#
-#     y = layers.Conv1D(32, kernel_size=5, padding="same",
-#                       kernel_regularizer=regularizers.l2(1e-4))(global_input_2)
-#     y = layers.BatchNormalization()(y)
-#     y = layers.Activation("relu")(y)
-#     y = layers.MaxPooling1D(pool_size=3)(y)                    # 301 → 100
-#
-#     y = layers.Conv1D(64, kernel_size=5, padding="same",
-#                       kernel_regularizer=regularizers.l2(1e-4))(y)
-#     y = layers.BatchNormalization()(y)
-#     y = layers.Activation("relu")(y)
-#     branch2_out = layers.GlobalAveragePooling1D()(y)           # → (64,)
-#
-#     # ── Classification head ───────────────────────────────────────────────────
-#     combined = layers.Concatenate()([branch1_out, branch2_out])  # → (192,)
-#
-#     z = layers.Dense(128, activation="relu",
-#                      kernel_regularizer=regularizers.l2(1e-4))(combined)
-#     z = layers.Dropout(0.5)(z)
-#     z = layers.Dense(32, activation="relu",
-#                      kernel_regularizer=regularizers.l2(1e-4))(z)
-#     z = layers.Dropout(0.5)(z)
-#     output = layers.Dense(1, activation="sigmoid")(z)
-#
-#     model = keras.Model(inputs=[global_input_1, global_input_2], outputs=output)
-#     model.compile(
-#         optimizer=keras.optimizers.Adam(learning_rate=1e-3),
-#         loss=focal_loss(gamma=2.0, alpha=0.5, smoothing=0.1),
-#         metrics=["accuracy", keras.metrics.AUC(name="auc")]
-#     )
-#     return model
+# REACTIVATED: this ablation-study code was archived in commit 6c8ad73 and is now
+# reactivated — the modality-convergence analysis (graphs.py Graph 1/4 annotations)
+# and the Bryson-vs-centroid-only comparison (graphs.py Graph 7) both require these
+# per-k flux-only / centroid-only AUCs.
+def build_model_flux_only():
+    """
+    Flux-only ablation variant of the dual-branch CNN.
+
+    Removes the centroid channels entirely — both branches operate on the flux
+    channel only (ch0). Used to establish the baseline performance achievable
+    from transit morphology alone, with no centroid information.
+
+    Architecture mirrors the combined model exactly:
+      Global: (301, 1), same pooling (4 then 5)
+      Local:  (61,  1), same pooling (3)
+    """
+    # ── Global branch: full orbit, flux only ────────────────────────────────
+    global_input = keras.Input(shape=(301, 1), name="global_input")
+
+    x = layers.Conv1D(32, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(global_input)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    x = layers.MaxPooling1D(pool_size=4)(x)                    # 301 → 75
+
+    x = layers.Conv1D(64, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    x = layers.MaxPooling1D(pool_size=5)(x)                    # 75  → 15
+
+    x = layers.Conv1D(128, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    global_out = layers.GlobalAveragePooling1D()(x)            # → (128,)
+
+    # ── Local branch: adaptive transit window, flux only ─────────────────────
+    local_input = keras.Input(shape=(61, 1), name="local_input")
+
+    y = layers.Conv1D(32, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(local_input)
+    y = layers.BatchNormalization()(y)
+    y = layers.Activation("relu")(y)
+    y = layers.MaxPooling1D(pool_size=3)(y)                    # 61  → 20
+
+    y = layers.Conv1D(64, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(y)
+    y = layers.BatchNormalization()(y)
+    y = layers.Activation("relu")(y)
+    local_out = layers.GlobalAveragePooling1D()(y)             # → (64,)
+
+    # ── Classification head ───────────────────────────────────────────────────
+    combined = layers.Concatenate()([global_out, local_out])   # → (192,)
+
+    z = layers.Dense(128, activation="relu",
+                     kernel_regularizer=regularizers.l2(1e-4))(combined)
+    z = layers.Dropout(0.5)(z)
+    z = layers.Dense(32, activation="relu",
+                     kernel_regularizer=regularizers.l2(1e-4))(z)
+    z = layers.Dropout(0.5)(z)
+    output = layers.Dense(1, activation="sigmoid")(z)
+
+    model = keras.Model(inputs=[global_input, local_input], outputs=output)
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+        loss=focal_loss(gamma=2.0, alpha=0.5, smoothing=0.1),
+        metrics=["accuracy", keras.metrics.AUC(name="auc")]
+    )
+    return model
+
+
+def build_model_centroid_only():
+    """
+    Centroid-only ablation variant of the dual-branch CNN.
+
+    Removes the flux channel entirely — both branches operate on centroid channels
+    (ch1=RA, ch2=Dec from X_global), shape (N, 301, 2). The local transit-window
+    view is not used — slicing the central bins of a centroid series has no
+    physical transit-morphology interpretation — so both input slots receive the
+    same full centroid sequence.
+
+    Branch 1 (3 Conv1D blocks, 32→64→128 filters, pools 4 then 5) mirrors the
+      combined global branch.
+    Branch 2 (2 Conv1D blocks, 32→64 filters, pool 3) mirrors the combined local-
+      branch architecture but on the full centroid sequence.
+
+    Used to isolate the contribution of centroid information alone, without transit
+    morphology features. Performance degrades with k as centroid SNR decreases.
+    """
+    # ── Branch 1: full centroid sequence, 3-block architecture ──────────────
+    global_input_1 = keras.Input(shape=(301, 2), name="global_input_1")
+
+    x = layers.Conv1D(32, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(global_input_1)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    x = layers.MaxPooling1D(pool_size=4)(x)                    # 301 → 75
+
+    x = layers.Conv1D(64, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    x = layers.MaxPooling1D(pool_size=5)(x)                    # 75  → 15
+
+    x = layers.Conv1D(128, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    branch1_out = layers.GlobalAveragePooling1D()(x)           # → (128,)
+
+    # ── Branch 2: same centroid sequence, 2-block architecture ──────────────
+    global_input_2 = keras.Input(shape=(301, 2), name="global_input_2")
+
+    y = layers.Conv1D(32, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(global_input_2)
+    y = layers.BatchNormalization()(y)
+    y = layers.Activation("relu")(y)
+    y = layers.MaxPooling1D(pool_size=3)(y)                    # 301 → 100
+
+    y = layers.Conv1D(64, kernel_size=5, padding="same",
+                      kernel_regularizer=regularizers.l2(1e-4))(y)
+    y = layers.BatchNormalization()(y)
+    y = layers.Activation("relu")(y)
+    branch2_out = layers.GlobalAveragePooling1D()(y)           # → (64,)
+
+    # ── Classification head ───────────────────────────────────────────────────
+    combined = layers.Concatenate()([branch1_out, branch2_out])  # → (192,)
+
+    z = layers.Dense(128, activation="relu",
+                     kernel_regularizer=regularizers.l2(1e-4))(combined)
+    z = layers.Dropout(0.5)(z)
+    z = layers.Dense(32, activation="relu",
+                     kernel_regularizer=regularizers.l2(1e-4))(z)
+    z = layers.Dropout(0.5)(z)
+    output = layers.Dense(1, activation="sigmoid")(z)
+
+    model = keras.Model(inputs=[global_input_1, global_input_2], outputs=output)
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+        loss=focal_loss(gamma=2.0, alpha=0.5, smoothing=0.1),
+        metrics=["accuracy", keras.metrics.AUC(name="auc")]
+    )
+    return model
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -837,143 +835,142 @@ def save_metrics_report(fold_metrics, ensemble_metrics, n_total, output_path,
 # SECTION 9 — ABLATION STUDY (flux-only and centroid-only variants)
 # ═════════════════════════════════════════════════════════════════════════════
 
-# ARCHIVED: the following ablation-study code (flux-only / centroid-only
-# variants) was originally built for a prior study that has since been
-# repurposed. It is not relevant to the current centroid-degradation study
-# goal and is disabled here to avoid its added training time. Kept for
-# reference rather than deleted.
-# def _run_ablation_study(
-#     X_global_cv: np.ndarray,
-#     X_local_cv: np.ndarray,
-#     y_cv: np.ndarray,
-#     groups_cv: np.ndarray,
-#     X_global_test: np.ndarray,
-#     X_local_test: np.ndarray,
-#     y_test: np.ndarray,
-#     kepid_test: np.ndarray,
-#     kepoi_test: np.ndarray,
-#     fp_subtype_test: np.ndarray,
-#     tag: str,
-# ) -> None:
-#     """
-#     Train flux-only and centroid-only CNN ablation variants using the same
-#     StratifiedGroupKFold splits (same seed) as the primary combined model.
-#
-#     This is a self-contained, simplified training loop — no OOF threshold
-#     optimisation, no full metrics report. It exists solely to produce per-target
-#     test scores for the ablation panel of the AUC-vs-resolution figure.
-#
-#     Code duplication relative to the main combined-model loop is intentional:
-#     refactoring the combined loop to share code would risk touching the primary
-#     study path, potentially introducing subtle behavioural drift in the most
-#     important model. Ablation models are secondary.
-#
-#     Only runs for psf=0 CSVs (indicated by the caller checking tag.endswith('psf0')).
-#
-#     Outputs:
-#         results_resolution/scores_{tag}_flux_only.csv
-#         results_resolution/scores_{tag}_centroid_only.csv
-#     """
-#     variants = [
-#         ("flux_only",     build_model_flux_only,    split_inputs_flux_only,    "[flux-only]"),
-#         ("centroid_only", build_model_centroid_only, split_inputs_centroid_only, "[centroid-only]"),
-#     ]
-#
-#     # Use the same fold structure as the combined model (same seed, same data)
-#     sgkf = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_SEED)
-#
-#     for variant_key, model_builder, input_splitter, print_label in variants:
-#         print(f"\n  Ablation {print_label} [{tag}] — training {N_FOLDS} folds ...")
-#
-#         fold_models_ab = []
-#
-#         for fold_idx, (train_idx, val_idx) in enumerate(
-#             sgkf.split(X_global_cv, y_cv, groups=groups_cv)
-#         ):
-#             # Leakage check — same guarantee as the combined loop
-#             train_kps_ab = set(groups_cv[train_idx])
-#             val_kps_ab   = set(groups_cv[val_idx])
-#             assert train_kps_ab.isdisjoint(val_kps_ab), \
-#                 f"Ablation {print_label} fold {fold_idx+1}: kepid leakage"
-#
-#             model_ab = model_builder()
-#
-#             # Build augmented sequence with overridden input splitter.
-#             # X_global is augmented; X_local is passed through unchanged.
-#             class _AblationSeq(Sequence):
-#                 """Augmented sequence for ablation with overridden input split."""
-#                 def __init__(self, Xg, Xl, y, batch_size, shuffle, splitter):
-#                     self.Xg = Xg; self.Xl = Xl; self.y = y
-#                     self.batch_size = batch_size
-#                     self.shuffle = shuffle; self.splitter = splitter
-#                     self.indices = np.arange(len(Xg)); self.on_epoch_end()
-#
-#                 def __len__(self):
-#                     return len(self.Xg) // self.batch_size
-#
-#                 def on_epoch_end(self):
-#                     if self.shuffle:
-#                         np.random.shuffle(self.indices)
-#
-#                 def __getitem__(self, idx):
-#                     bidx = self.indices[idx * self.batch_size:(idx + 1) * self.batch_size]
-#                     Xg_b = self.Xg[bidx].copy()   # augment global branch
-#                     Xl_b = self.Xl[bidx]           # local branch unchanged
-#                     yb   = self.y[bidx]
-#                     for i in range(len(Xg_b)):
-#                         shift = np.random.randint(-20, 21)
-#                         Xg_b[i] = np.roll(Xg_b[i], shift, axis=0)
-#                         Xg_b[i, :, 0] += np.random.normal(
-#                             0, 0.02, NUM_BINS).astype(np.float32)
-#                         Xg_b[i, :, 0] *= np.random.uniform(0.95, 1.05)
-#                     return self.splitter(Xg_b, Xl_b), yb
-#
-#             train_gen_ab = _AblationSeq(
-#                 X_global_cv[train_idx], X_local_cv[train_idx],
-#                 y_cv[train_idx], BATCH_SIZE, shuffle=True,
-#                 splitter=input_splitter,
-#             )
-#             val_data_ab = (
-#                 input_splitter(X_global_cv[val_idx], X_local_cv[val_idx]),
-#                 y_cv[val_idx],
-#             )
-#
-#             callbacks_ab = [
-#                 LearningRateScheduler(warmup_schedule, verbose=0),
-#                 ReduceLROnPlateau(monitor="val_auc", factor=0.5, patience=7,
-#                                   mode="max", min_lr=1e-6, verbose=0),
-#                 EarlyStopping(monitor="val_auc", patience=15, mode="max",
-#                               restore_best_weights=True, verbose=0),
-#             ]
-#
-#             history_ab = model_ab.fit(
-#                 train_gen_ab,
-#                 validation_data=val_data_ab,
-#                 epochs=EPOCHS,
-#                 callbacks=callbacks_ab,
-#                 class_weight=CLASS_WEIGHT,
-#                 verbose=0,
-#             )
-#             best_auc_ab = max(history_ab.history["val_auc"])
-#             print(f"    {print_label} Fold {fold_idx+1}: best val AUC = {best_auc_ab:.4f}")
-#             fold_models_ab.append(model_ab)
-#
-#         # Ensemble test scores
-#         test_probs_ab = np.zeros(len(X_global_test))
-#         for m_ab in fold_models_ab:
-#             test_probs_ab += m_ab.predict(
-#                 input_splitter(X_global_test, X_local_test), verbose=0, batch_size=64
-#             ).flatten()
-#             tf.keras.backend.clear_session()
-#         test_probs_ab /= N_FOLDS
-#
-#         test_auc_ab = roc_auc_score(y_test, test_probs_ab)
-#         print(f"  {print_label} [{tag}] Test AUC: {test_auc_ab:.4f}")
-#
-#         scores_path_ab = os.path.join(OUTPUT_DIR, f"scores_{tag}_{variant_key}.csv")
-#         save_scores(kepid_test, kepoi_test, fp_subtype_test,
-#                     y_test, test_probs_ab, scores_path_ab)
-#
+# REACTIVATED: this ablation-study code was archived in commit 6c8ad73 and is now
+# reactivated — the modality-convergence analysis (graphs.py Graph 1/4 annotations)
+# and the Bryson-vs-centroid-only comparison (graphs.py Graph 7) both require these
+# per-k flux-only / centroid-only AUCs.
+def _run_ablation_study(
+    X_global_cv: np.ndarray,
+    X_local_cv: np.ndarray,
+    y_cv: np.ndarray,
+    groups_cv: np.ndarray,
+    X_global_test: np.ndarray,
+    X_local_test: np.ndarray,
+    y_test: np.ndarray,
+    kepid_test: np.ndarray,
+    kepoi_test: np.ndarray,
+    fp_subtype_test: np.ndarray,
+    tag: str,
+) -> None:
+    """
+    Train flux-only and centroid-only CNN ablation variants using the same
+    StratifiedGroupKFold splits (same seed) as the primary combined model.
+
+    This is a self-contained, simplified training loop — no OOF threshold
+    optimisation, no full metrics report. It exists solely to produce per-target
+    test scores for the ablation panel of the AUC-vs-resolution figure.
+
+    Code duplication relative to the main combined-model loop is intentional:
+    refactoring the combined loop to share code would risk touching the primary
+    study path, potentially introducing subtle behavioural drift in the most
+    important model. Ablation models are secondary.
+
+    Only runs for psf=0 CSVs (indicated by the caller checking tag.endswith('psf0')).
+
+    Outputs:
+        results_resolution/scores_{tag}_flux_only.csv
+        results_resolution/scores_{tag}_centroid_only.csv
+    """
+    variants = [
+        ("flux_only",     build_model_flux_only,    split_inputs_flux_only,    "[flux-only]"),
+        ("centroid_only", build_model_centroid_only, split_inputs_centroid_only, "[centroid-only]"),
+    ]
+
+    # Use the same fold structure as the combined model (same seed, same data)
+    sgkf = StratifiedGroupKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+
+    for variant_key, model_builder, input_splitter, print_label in variants:
+        print(f"\n  Ablation {print_label} [{tag}] — training {N_FOLDS} folds ...")
+
+        fold_models_ab = []
+
+        for fold_idx, (train_idx, val_idx) in enumerate(
+            sgkf.split(X_global_cv, y_cv, groups=groups_cv)
+        ):
+            # Leakage check — same guarantee as the combined loop
+            train_kps_ab = set(groups_cv[train_idx])
+            val_kps_ab   = set(groups_cv[val_idx])
+            assert train_kps_ab.isdisjoint(val_kps_ab), \
+                f"Ablation {print_label} fold {fold_idx+1}: kepid leakage"
+
+            model_ab = model_builder()
+
+            # Build augmented sequence with overridden input splitter.
+            # X_global is augmented; X_local is passed through unchanged.
+            class _AblationSeq(Sequence):
+                """Augmented sequence for ablation with overridden input split."""
+                def __init__(self, Xg, Xl, y, batch_size, shuffle, splitter):
+                    self.Xg = Xg; self.Xl = Xl; self.y = y
+                    self.batch_size = batch_size
+                    self.shuffle = shuffle; self.splitter = splitter
+                    self.indices = np.arange(len(Xg)); self.on_epoch_end()
+
+                def __len__(self):
+                    return len(self.Xg) // self.batch_size
+
+                def on_epoch_end(self):
+                    if self.shuffle:
+                        np.random.shuffle(self.indices)
+
+                def __getitem__(self, idx):
+                    bidx = self.indices[idx * self.batch_size:(idx + 1) * self.batch_size]
+                    Xg_b = self.Xg[bidx].copy()   # augment global branch
+                    Xl_b = self.Xl[bidx]           # local branch unchanged
+                    yb   = self.y[bidx]
+                    for i in range(len(Xg_b)):
+                        shift = np.random.randint(-20, 21)
+                        Xg_b[i] = np.roll(Xg_b[i], shift, axis=0)
+                        Xg_b[i, :, 0] += np.random.normal(
+                            0, 0.02, NUM_BINS).astype(np.float32)
+                        Xg_b[i, :, 0] *= np.random.uniform(0.95, 1.05)
+                    return self.splitter(Xg_b, Xl_b), yb
+
+            train_gen_ab = _AblationSeq(
+                X_global_cv[train_idx], X_local_cv[train_idx],
+                y_cv[train_idx], BATCH_SIZE, shuffle=True,
+                splitter=input_splitter,
+            )
+            val_data_ab = (
+                input_splitter(X_global_cv[val_idx], X_local_cv[val_idx]),
+                y_cv[val_idx],
+            )
+
+            callbacks_ab = [
+                LearningRateScheduler(warmup_schedule, verbose=0),
+                ReduceLROnPlateau(monitor="val_auc", factor=0.5, patience=7,
+                                  mode="max", min_lr=1e-6, verbose=0),
+                EarlyStopping(monitor="val_auc", patience=15, mode="max",
+                              restore_best_weights=True, verbose=0),
+            ]
+
+            history_ab = model_ab.fit(
+                train_gen_ab,
+                validation_data=val_data_ab,
+                epochs=EPOCHS,
+                callbacks=callbacks_ab,
+                class_weight=CLASS_WEIGHT,
+                verbose=0,
+            )
+            best_auc_ab = max(history_ab.history["val_auc"])
+            print(f"    {print_label} Fold {fold_idx+1}: best val AUC = {best_auc_ab:.4f}")
+            fold_models_ab.append(model_ab)
+
+        # Ensemble test scores
+        test_probs_ab = np.zeros(len(X_global_test))
+        for m_ab in fold_models_ab:
+            test_probs_ab += m_ab.predict(
+                input_splitter(X_global_test, X_local_test), verbose=0, batch_size=64
+            ).flatten()
+            tf.keras.backend.clear_session()
+        test_probs_ab /= N_FOLDS
+
+        test_auc_ab = roc_auc_score(y_test, test_probs_ab)
+        print(f"  {print_label} [{tag}] Test AUC: {test_auc_ab:.4f}")
+
+        scores_path_ab = os.path.join(OUTPUT_DIR, f"scores_{tag}_{variant_key}.csv")
+        save_scores(kepid_test, kepoi_test, fp_subtype_test,
+                    y_test, test_probs_ab, scores_path_ab)
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION 10 — MAIN PIPELINE
@@ -1156,19 +1153,18 @@ def _train_and_eval_one_csv(csv_path: str) -> None:
     # ── Ablation study (psf=0 CSVs only) ─────────────────────────────────────
     # The ablation is a secondary analysis; only run for the rebinning-only
     # (psf=0) result set to avoid 2x the compute with minimal additional insight.
-# ARCHIVED: the following ablation-study code (flux-only / centroid-only
-# variants) was originally built for a prior study that has since been
-# repurposed. It is not relevant to the current centroid-degradation study
-# goal and is disabled here to avoid its added training time. Kept for
-# reference rather than deleted.
-#     if tag.endswith("psf0"):
-#         print(f"\n  Running ablation study for {tag} ...")
-#         _run_ablation_study(
-#             X_global_cv, X_local_cv, y_cv, groups_cv,
-#             X_global_test, X_local_test, y_test,
-#             kepid_test, kepoi_test, fp_subtype_test,
-#             tag,
-#         )
+    # REACTIVATED: this ablation-study code was archived in commit 6c8ad73 and is
+    # now reactivated — the modality-convergence analysis (graphs.py Graph 1/4
+    # annotations) and the Bryson-vs-centroid-only comparison (graphs.py Graph 7)
+    # both require these per-k flux-only / centroid-only AUCs.
+    if tag.endswith("psf0"):
+        print(f"\n  Running ablation study for {tag} ...")
+        _run_ablation_study(
+            X_global_cv, X_local_cv, y_cv, groups_cv,
+            X_global_test, X_local_test, y_test,
+            kepid_test, kepoi_test, fp_subtype_test,
+            tag,
+        )
 
 
 def main():

@@ -1,7 +1,7 @@
 """
 graphs.py — Publication Figures for the Centroid-Resolution Degradation Study
 
-Generates six publication-quality figures from pre-computed results in
+Generates seven publication-quality figures from pre-computed results in
 results_resolution/. All plots can be regenerated independently of the
 expensive pipeline stages — this module only reads CSVs and is safe to re-run.
 
@@ -12,6 +12,7 @@ Figures produced (in graphs/ subdir):
   fig4_cnn_auc_threshold.png  — fig1 + 0.90 threshold line + crossing annotation
   fig5_bryson_binary_threshold.png  — fig2 + accuracy CI + 0.90 threshold + annotation
   fig6_bryson_continuous_threshold.png — fig3 + 0.90 threshold + crossing annotation
+  fig7_centroid_signal_comparison.png — Bryson continuous vs. centroid-only CNN AUC
 
 Styling conventions:
   PSF off (rebinning only)    — solid lines, full opacity
@@ -49,6 +50,8 @@ K_VALUES         = [1, 2, 3, 4, 5]
 EFFECTIVE_SCALES = [k * KEPLER_SCALE for k in K_VALUES]   # [3.98, 7.96, …, 19.9]
 
 AUC_THRESHOLD    = 0.90                         # absolute threshold for k_break_90 plots
+MODALITY_CONVERGENCE_EPSILON = 0.01             # |combined_auc - flux_only_auc| convergence tol
+MIN_SAMPLES_FOR_PLOT = 10                       # matches baselines.py's hardcoded len(valid)<10
 
 # Colour palette (Colorbrewer-safe, colour-blind tested)
 COLOR_PSF_OFF          = "#4878cf"   # blue  — combined CNN / Bryson, PSF off
@@ -187,6 +190,90 @@ def _load_ablation_aucs(results_dir: str) -> dict[str, list[float | None]]:
     return result
 
 
+def find_modality_convergence_k(
+    combined_auc_by_k: dict[int, float],
+    flux_only_auc_by_k: dict[int, float],
+    epsilon: float = MODALITY_CONVERGENCE_EPSILON,
+) -> dict:
+    """
+    Determine where (if ever) the combined-model AUC converges onto the flux-only
+    ablation AUC ceiling, meaning centroid information stops adding measurable value
+    even though the centroid channel is still present in the input.
+
+    Not built on _find_first_crossing/_annotate_crossing — those are for "y crosses
+    a fixed y-threshold," this is "two series converge onto each other."
+
+    Algorithm: scan k descending; find the smallest k such that
+    |combined[k] - flux_only[k]| <= epsilon holds for that k AND every larger k.
+
+    Returns dict:
+        converged_k: int | None
+        status: "converges" | "persists" | "no_contribution"
+            "converges"       — centroid helps up to some k, then AUC saturates onto
+                                 the flux-only ceiling for all coarser k.
+            "no_contribution" — converged_k is the smallest available k: combined
+                                 never meaningfully exceeds flux-only, even natively.
+            "persists"        — never converges through k_max: centroid information
+                                 contributes across the whole tested degradation range.
+    """
+    usable_ks = sorted(
+        k for k in combined_auc_by_k
+        if k in flux_only_auc_by_k
+        and combined_auc_by_k[k] is not None
+        and flux_only_auc_by_k[k] is not None
+    )
+    if not usable_ks:
+        print("  find_modality_convergence_k: no overlapping k values — skipping annotation")
+        return {"converged_k": None, "status": "persists"}
+
+    diffs = {k: abs(combined_auc_by_k[k] - flux_only_auc_by_k[k]) for k in usable_ks}
+
+    converged_k = None
+    for k in usable_ks:
+        if all(diffs[k2] <= epsilon for k2 in usable_ks if k2 >= k):
+            converged_k = k
+            break
+
+    if converged_k is None:
+        return {"converged_k": None, "status": "persists"}
+    if converged_k == min(usable_ks):
+        return {"converged_k": converged_k, "status": "no_contribution"}
+    return {"converged_k": converged_k, "status": "converges"}
+
+
+def _annotate_modality_convergence(
+    ax: plt.Axes, df: pd.DataFrame, ablation: dict[str, list]
+) -> None:
+    """
+    Shared annotation logic for plot_cnn_auc and plot_cnn_auc_threshold: mark the k
+    at which the combined-model (PSF-off) AUC converges onto the flux-only ablation
+    AUC ceiling (see find_modality_convergence_k).
+    """
+    psf0 = df[df["psf"] == 0].sort_values("k")
+    if psf0.empty or "cnn_auc" not in psf0.columns:
+        return
+    combined_by_k = dict(zip(psf0["k"], psf0["cnn_auc"]))
+    flux_only_by_k = {k: a for k, a in zip(K_VALUES, ablation.get("flux_only", []))}
+
+    conv = find_modality_convergence_k(combined_by_k, flux_only_by_k)
+
+    if conv["status"] == "converges":
+        x_conv = conv["converged_k"] * KEPLER_SCALE
+        ax.axvline(x_conv, color=COLOR_THRESHOLD, linestyle=":", linewidth=1, alpha=0.6)
+        ax.annotate(
+            f"Combined ≈ flux-only from k={conv['converged_k']}",
+            xy=(x_conv, 0.5), xytext=(x_conv + 0.5, 0.55),
+            fontsize=8, arrowprops=dict(arrowstyle="->", color=COLOR_THRESHOLD, lw=0.9),
+            color=COLOR_THRESHOLD,
+        )
+    elif conv["status"] == "persists":
+        ax.text(0.03, 0.06, "Centroid signal contributes across all tested k",
+                transform=ax.transAxes, fontsize=8, color=COLOR_THRESHOLD)
+    elif conv["status"] == "no_contribution":
+        ax.text(0.03, 0.06, "No measurable centroid contribution at any k",
+                transform=ax.transAxes, fontsize=8, color=COLOR_THRESHOLD)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # FIGURE 1 — CNN AUC vs scale (no threshold)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -237,6 +324,8 @@ def plot_cnn_auc(df: pd.DataFrame, results_dir: str, out_path: str, fmt: str) ->
             y_abl = [a for a in aucs if a is not None]
             ax.plot(x_abl, y_abl, color=color, linestyle="-", marker="s",
                     label=label)
+
+    _annotate_modality_convergence(ax, df, ablation)
 
     ax.axhline(0.5, color="gray", linestyle=":", linewidth=1.2, label="Random (0.5)")
     ax.set_xlabel("Effective pixel scale (arcsec/pixel)")
@@ -407,6 +496,8 @@ def plot_cnn_auc_threshold(
             y_abl = [a for a in aucs if a is not None]
             ax.plot(x_abl, y_abl, color=color, linestyle="-", marker="s", label=label)
 
+    _annotate_modality_convergence(ax, df, ablation)
+
     ax.axhline(AUC_THRESHOLD, color=COLOR_THRESHOLD, linestyle="--",
                linewidth=1.5, label=f"AUC = {AUC_THRESHOLD:.2f}")
     ax.axhline(0.5, color="gray", linestyle=":", linewidth=1.2)
@@ -561,6 +652,90 @@ def plot_bryson_continuous_threshold(df: pd.DataFrame, out_path: str, fmt: str) 
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FIGURE 7 — Bryson continuous vs. centroid-only CNN (direct signal comparison)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_centroid_signal_comparison(
+    df: pd.DataFrame, results_dir: str, out_path: str, fmt: str
+) -> None:
+    """
+    Figure 7: direct comparison of a classical statistic (Bryson continuous SNR
+    test) vs. a learned feature extractor (centroid-only CNN ablation), both
+    applied to the same degrading centroid signal, PSF off only.
+
+    Bryson and the centroid-only CNN are evaluated on genuinely different
+    populations by construction: Bryson's n (n_valid_centroid) is quality-gated
+    (excludes both hard- and soft-degenerate targets) and drawn from a population
+    with no train/test split (Bryson needs no training); the CNN ablation's n
+    (centroid_only_n) is its held-out test-fold row count (~20% of data), gated
+    only by hard-degeneracy (soft-degenerate targets are deliberately kept in as
+    flat-channel CNN inputs). These will generally differ — each line gets its
+    own sample-size annotation, never a shared one.
+
+    Points with fewer than MIN_SAMPLES_FOR_PLOT valid samples are omitted rather
+    than plotted as a misleading AUC from too small a sample.
+
+    CI bands use the same inline fill_between pattern as the other _threshold
+    plotters — no shared CI helper exists yet in this file, and creating one now
+    (its second use, not a third+) would be premature (YAGNI).
+    """
+    required = ["k", "psf", "bryson_auc", "bryson_ci_lo", "bryson_ci_hi",
+                "centroid_only_auc", "centroid_only_auc_ci_lo", "centroid_only_auc_ci_hi",
+                "n_valid_centroid", "centroid_only_n", "effective_scale_arcsec"]
+    for col in required:
+        if col not in df.columns:
+            _warn_missing(col, "breakdown.csv")
+            return
+
+    sub = df[df["psf"] == 0].sort_values("k")
+    if sub.empty:
+        print("  Figure 7: no PSF-off rows — skipping")
+        return
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    for auc_col, lo_col, hi_col, n_col, color, label in [
+        ("bryson_auc", "bryson_ci_lo", "bryson_ci_hi", "n_valid_centroid",
+         COLOR_PSF_OFF, "Bryson continuous"),
+        ("centroid_only_auc", "centroid_only_auc_ci_lo", "centroid_only_auc_ci_hi",
+         "centroid_only_n", COLOR_CENTROID_ONLY, "Centroid-only CNN"),
+    ]:
+        n_vals = sub[n_col].values.astype(float)
+        mask = n_vals >= MIN_SAMPLES_FOR_PLOT
+        plot_sub = sub[mask]
+        if plot_sub.empty:
+            continue
+        x = plot_sub["effective_scale_arcsec"].values
+        y = plot_sub[auc_col].values.astype(float)
+        valid = ~np.isnan(y)
+        if not valid.any():
+            continue
+        ax.plot(x[valid], y[valid], color=color, marker="o", label=label)
+
+        y_lo = plot_sub[lo_col].values.astype(float)
+        y_hi = plot_sub[hi_col].values.astype(float)
+        ci_valid = valid & ~np.isnan(y_lo) & ~np.isnan(y_hi)
+        if ci_valid.any():
+            ax.fill_between(x[ci_valid], y_lo[ci_valid], y_hi[ci_valid],
+                             color=color, alpha=0.15)
+
+        n_label = "n_bryson" if n_col == "n_valid_centroid" else "n_cnn"
+        n_plot = plot_sub[n_col].values[valid]
+        for xi, yi, n in zip(x[valid], y[valid], n_plot):
+            ax.annotate(f"{n_label}={int(n)}", xy=(xi, yi), xytext=(0, 6),
+                        textcoords="offset points", fontsize=7, ha="center", color=color)
+
+    ax.axhline(0.5, color="gray", linestyle=":", linewidth=1.2, label="Random (0.5)")
+    ax.set_xlabel("Effective pixel scale (arcsec/pixel)")
+    ax.set_ylabel("ROC-AUC")
+    ax.set_ylim(0.4, 1.02)
+    ax.set_title("Centroid signal extraction: classical statistic vs. learned feature")
+    ax.legend(loc="lower left")
+    plt.tight_layout()
+    _save(fig, out_path, fmt)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -607,6 +782,10 @@ def generate_all_graphs(results_dir: str, fmt: str = "png") -> None:
     plot_bryson_continuous_threshold(
         df,
         os.path.join(graphs_dir, f"fig6_bryson_continuous_threshold.{fmt}"), fmt
+    )
+    plot_centroid_signal_comparison(
+        df, results_dir,
+        os.path.join(graphs_dir, f"fig7_centroid_signal_comparison.{fmt}"), fmt
     )
 
     print(f"\nAll graphs written to {graphs_dir}/")

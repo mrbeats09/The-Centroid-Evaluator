@@ -4,8 +4,10 @@ failed_targets.log
 sparse_targets.log
 tpf_temp
 tess_training_data.csv
-kepler_training_data_*.csv
+kepler_training_data_*.cdv
 cache/
+results/ 
+results_resolution/
 .DS_Store
 .claude
 CLAUDE.md

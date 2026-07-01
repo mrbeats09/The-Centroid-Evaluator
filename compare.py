@@ -128,11 +128,34 @@ def plot_difference_images(
 
         for col_idx, k in enumerate(k_values):
             ax = axes[row_idx, col_idx]
+
+            # Degeneracy guard: skip live recompute for any (kepid, k) whose cached
+            # centroid data is missing or flagged quality_degenerate (grid/aperture
+            # too small to trust — see superpixel_rebin in degrade.py). Recomputing
+            # live here would otherwise reproduce the misleading flat-colour / blank
+            # panels the aperture-degeneracy bug originally produced.
+            cache_path = os.path.join(cache_dir, "centroids", f"{kepid}_k{k}_psf0.npz")
+            degenerate = True
+            if os.path.exists(cache_path):
+                try:
+                    cache_data = np.load(cache_path)
+                    degenerate = bool(cache_data["quality_degenerate"]) \
+                        if "quality_degenerate" in cache_data else False
+                except Exception as exc:
+                    print(f"  Figure 3: KIC {kepid} k={k}: cache read error: "
+                          f"{type(exc).__name__}: {exc}")
+                    degenerate = True
+
+            if degenerate:
+                ax.text(0.5, 0.5, "Excluded: degenerate\naperture at this k",
+                        ha="center", va="center", fontsize=7.5, transform=ax.transAxes)
+                ax.set_title(f"k={k} ({k*KEPLER_PIXEL_SCALE_ARCSEC:.1f}″/px)", fontsize=9)
+                ax.set_xticks([])
+                ax.set_yticks([])
+                continue
+
             try:
-                if k > 1:
-                    coarse, _ = superpixel_rebin(cube, aperture, k)
-                else:
-                    coarse = cube
+                coarse, _coarse_aper, _degeneracy = superpixel_rebin(cube, aperture, k)
 
                 result = difference_image_centroid(
                     coarse, time_tpf, period, t0_bkjd, dur_days, k=k

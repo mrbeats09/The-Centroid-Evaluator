@@ -318,8 +318,12 @@ def compute_breakdown(
         if cq is not None:
             # Determine if cq is per-target (has 'kepid') or pre-aggregated (has 'label')
             if "centroid_snr" in cq.columns:
-                # Per-target file: compute medians ourselves
+                # Per-target file: compute medians ourselves.
+                # Exclude quality_degenerate rows — their SNR is derived from a grid
+                # too small to trust (see centroid_quality.py's aggregate() docstring).
                 cq_fp = cq[(cq["psf"] == psf_val) & (cq["label"] == 0)].copy()
+                if "quality_degenerate" in cq_fp.columns:
+                    cq_fp = cq_fp[~cq_fp["quality_degenerate"].astype(bool)]
                 for k_val in sorted(sub["k"].values):
                     cq_k = cq_fp[cq_fp["k"] == k_val]
                     if cq_k.empty:
@@ -339,6 +343,50 @@ def compute_breakdown(
                         auc_table.loc[mask, "k_break_snr"] = cq_row["k"]
                         break
 
+    return auc_table
+
+
+def add_ablation_ci_columns(
+    auc_table: pd.DataFrame,
+    results_dir: str,
+    n_bootstrap: int = N_BOOTSTRAP,
+) -> pd.DataFrame:
+    """
+    For psf==0 rows, read scores_k{k}_psf0_centroid_only.csv (flat in results_dir,
+    written by theModel.py's centroid-only ablation via save_scores) and compute
+    bootstrap_auc (reuses the frozen 3-tuple signature). Adds/overwrites
+    'centroid_only_auc', 'centroid_only_auc_ci_lo', 'centroid_only_auc_ci_hi', and
+    'centroid_only_n' (row count of that scores CSV — the CNN ablation's own
+    held-out-test-fold sample size, generally different from n_valid_centroid since
+    Bryson/centroid-quality and the CNN ablation are scored over different
+    populations: Bryson needs no train/test split, the CNN only sees its held-out
+    fold). NaN for psf==1 rows and for any k with a missing score file.
+    """
+    auc_table = auc_table.copy()
+    for col in ["centroid_only_auc", "centroid_only_auc_ci_lo",
+                "centroid_only_auc_ci_hi", "centroid_only_n"]:
+        if col not in auc_table.columns:
+            auc_table[col] = np.nan
+
+    for idx, row in auc_table[auc_table["psf"] == 0].iterrows():
+        k = int(row["k"])
+        path = os.path.join(results_dir, f"scores_k{k}_psf0_centroid_only.csv")
+        if not os.path.exists(path):
+            continue
+        try:
+            df = pd.read_csv(path)
+            if "label" not in df.columns or "score" not in df.columns:
+                continue
+            y_true, y_score = df["label"].values, df["score"].values
+            if len(np.unique(y_true)) < 2:
+                continue
+            auc, lo, hi = bootstrap_auc(y_true, y_score, n_iter=n_bootstrap)
+            auc_table.loc[idx, "centroid_only_auc"] = auc
+            auc_table.loc[idx, "centroid_only_auc_ci_lo"] = lo
+            auc_table.loc[idx, "centroid_only_auc_ci_hi"] = hi
+            auc_table.loc[idx, "centroid_only_n"] = len(df)
+        except Exception as exc:
+            print(f"  add_ablation_ci_columns k={k}: {type(exc).__name__}: {exc}")
     return auc_table
 
 
@@ -406,6 +454,17 @@ def main():
             threshold=ABSOLUTE_AUC_THRESHOLD,
         )
 
+        # n_valid_centroid: count of non-quality-degenerate targets at this (k, psf),
+        # sourced from centroid_quality_per_target.csv. Distinct from n_test (CNN
+        # test-set size, unaffected by soft-degeneracy — the CNN uses even flat/
+        # uninformative centroid channels as-is; only Bryson/quality metrics are
+        # gated by quality_degenerate).
+        if cq is not None and "quality_degenerate" in cq.columns:
+            cq_kpsf = cq[(cq["k"] == k) & (cq["psf"] == psf)]
+            n_valid_centroid = int((~cq_kpsf["quality_degenerate"].astype(bool)).sum())
+        else:
+            n_valid_centroid = np.nan
+
         row = {
             "k":                      k,
             "effective_scale_arcsec": k * 3.98,
@@ -413,6 +472,7 @@ def main():
             "n_test":                 len(df),
             "n_planet":               int((y_true == 1).sum()),
             "n_fp":                   int((y_true == 0).sum()),
+            "n_valid_centroid":       n_valid_centroid,
             "cnn_auc":                auc,
             "cnn_ci_lo":              ci_lo,
             "cnn_ci_hi":              ci_hi,
@@ -457,6 +517,7 @@ def main():
         snr_threshold=args.snr_threshold,
         test_kepids=all_test_kepids,
     )
+    auc_df = add_ablation_ci_columns(auc_df, args.results_dir, n_bootstrap=args.n_bootstrap)
 
     # Benjamini-Hochberg FDR correction on P(AUC ≤ 0.90).
     # bh_significant = True means "AUC is significantly above 0.90 after FDR control",

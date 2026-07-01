@@ -74,8 +74,12 @@ def load_quality_records(
                             if "centroid_snr" in data else np.nan,
                         "offset_arcsec": float(data["offset_arcsec"])
                             if "offset_arcsec" in data else np.nan,
+                        "quality_degenerate": bool(data["quality_degenerate"])
+                            if "quality_degenerate" in data else False,
                     })
-                except Exception:
+                except Exception as exc:
+                    print(f"  load_quality_records KIC {kepid} k={k} psf={psf}: "
+                          f"{type(exc).__name__}: {exc}")
                     continue
 
     if not records:
@@ -86,21 +90,34 @@ def load_quality_records(
 
 
 def aggregate(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate per (k, psf, label): median and IQR of each quality metric."""
+    """
+    Aggregate per (k, psf, label): median and IQR of each quality metric.
+
+    Rows flagged quality_degenerate (grid/aperture too small to trust the
+    diff-image offset/uncertainty statistics — see superpixel_rebin in
+    degrade.py) are excluded from the medians/IQR, since dividing by their
+    near-zero variance is exactly what produces the misleading SNR spikes /
+    near-zero uncertainty seen at high k. n_targets reflects only the valid
+    (non-degenerate) count; n_targets_total/n_quality_degenerate retain the
+    full picture for transparency.
+    """
     metrics = ["centroid_rms", "centroid_uncertainty", "centroid_snr", "offset_arcsec"]
     rows = []
 
     for (k, psf, label), group in df.groupby(["k", "psf", "label"]):
+        valid_group = group[~group["quality_degenerate"]]
         row = {
             "k": k,
             "effective_scale_arcsec": k * KEPLER_PIXEL_SCALE_ARCSEC,
             "psf": psf,
             "label": int(label),
             "label_name": "planet" if label == 1 else "fp",
-            "n_targets": len(group),
+            "n_targets": len(valid_group),
+            "n_targets_total": len(group),
+            "n_quality_degenerate": len(group) - len(valid_group),
         }
         for m in metrics:
-            vals = group[m].dropna()
+            vals = valid_group[m].dropna()
             row[f"median_{m}"] = float(vals.median()) if len(vals) else np.nan
             q25, q75 = (float(vals.quantile(0.25)), float(vals.quantile(0.75))) \
                 if len(vals) >= 4 else (np.nan, np.nan)
@@ -111,17 +128,21 @@ def aggregate(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def scaling_summary(df: pd.DataFrame) -> pd.DataFrame:
-    """Per (k, psf): median uncertainty and SNR across all targets."""
+    """
+    Per (k, psf): median uncertainty and SNR across all non-degenerate targets
+    (quality_degenerate rows excluded — see aggregate()'s docstring).
+    """
     rows = []
     for (k, psf), group in df.groupby(["k", "psf"]):
+        valid_group = group[~group["quality_degenerate"]]
         rows.append({
             "k": k,
             "effective_scale_arcsec": k * KEPLER_PIXEL_SCALE_ARCSEC,
             "psf": int(psf),
-            "n_targets": len(group),
-            "median_uncertainty": float(group["centroid_uncertainty"].median()),
-            "median_rms": float(group["centroid_rms"].median()),
-            "median_snr": float(group["centroid_snr"].median()),
+            "n_targets": len(valid_group),
+            "median_uncertainty": float(valid_group["centroid_uncertainty"].median()),
+            "median_rms": float(valid_group["centroid_rms"].median()),
+            "median_snr": float(valid_group["centroid_snr"].median()),
         })
     return pd.DataFrame(rows)
 
@@ -223,6 +244,14 @@ def main():
         sys.exit(0)
 
     print(f"Loaded {len(df):,} records ({df['kepid'].nunique():,} unique targets)")
+
+    print("\nQuality-degenerate exclusion summary (per k, psf):")
+    print(f"  {'k':>4} {'psf':>4} {'n_total':>10} {'n_degenerate':>14} {'pct':>8}")
+    for (k, psf), group in df.groupby(["k", "psf"]):
+        n_total = len(group)
+        n_deg = int(group["quality_degenerate"].sum())
+        pct = n_deg / n_total if n_total else 0.0
+        print(f"  {k:>4} {psf:>4} {n_total:>10} {n_deg:>14} {pct:>7.1%}")
 
     agg = aggregate(df)
 
