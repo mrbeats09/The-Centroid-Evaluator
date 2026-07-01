@@ -138,7 +138,7 @@ def check_scaling_linearity(scaling: pd.DataFrame) -> None:
             print(f"  PSF {label}: Pearson r = {r:.3f}  [{status}]")
         print(f"  PSF {'on' if psf_val else 'off'} scaling table:")
         for _, row in sub.iterrows():
-            print(f"    k={row['k']:d}  {row['effective_scale_arcsec']:.1f} arcsec  "
+            print(f"    k={int(row['k']):d}  {row['effective_scale_arcsec']:.1f} arcsec  "
                   f"median_unc={row['median_uncertainty']:.4f}  "
                   f"median_snr={row['median_snr']:.3f}")
 

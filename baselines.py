@@ -23,11 +23,11 @@ vetting baseline (--enable-vetting only):
   Runs vetting.centroid_test on rebinned TPFs. All failures are caught and logged;
   they never terminate the run. Un-testable targets are counted per k.
 
-Outputs:
-  results_resolution/bryson_scores_k{K}_psf{P}.csv       — per-target Bryson scores
-  results_resolution/bryson_binary_scores_k{K}_psf{P}.csv — per-target binary predictions
+Outputs (per k, psf; grouped under results_resolution/k{K}_psf{P}/):
+  results_resolution/k{K}_psf{P}/bryson_scores_k{K}_psf{P}.csv       — per-target Bryson scores
+  results_resolution/k{K}_psf{P}/bryson_binary_scores_k{K}_psf{P}.csv — per-target binary predictions
   results_resolution/breakdown.csv                        — updated with all Bryson metrics
-  (if --enable-vetting) results_resolution/vetting_scores_k{K}_psf{P}.csv
+  (if --enable-vetting) results_resolution/k{K}_psf{P}/vetting_scores_k{K}_psf{P}.csv
 """
 
 import argparse
@@ -491,7 +491,9 @@ def update_breakdown_csv(
 
     # ── Bryson continuous scores ──────────────────────────────────────────────
     for (k, psf), bdf in sorted(bryson_results.items()):
-        out_path = os.path.join(results_dir, f"bryson_scores_k{k}_psf{psf}.csv")
+        out_subdir = os.path.join(results_dir, f"k{k}_psf{psf}")
+        os.makedirs(out_subdir, exist_ok=True)
+        out_path = os.path.join(out_subdir, f"bryson_scores_k{k}_psf{psf}.csv")
         bdf.to_csv(out_path, index=False)
 
         valid = bdf.dropna(subset=["bryson_score"])
@@ -519,7 +521,9 @@ def update_breakdown_csv(
 
     # ── Bryson binary scores (PRIMARY Bryson result) ──────────────────────────
     for (k, psf), bbin_df in sorted(bryson_binary_results.items()):
-        out_path = os.path.join(results_dir, f"bryson_binary_scores_k{k}_psf{psf}.csv")
+        out_subdir = os.path.join(results_dir, f"k{k}_psf{psf}")
+        os.makedirs(out_subdir, exist_ok=True)
+        out_path = os.path.join(out_subdir, f"bryson_binary_scores_k{k}_psf{psf}.csv")
         bbin_df.to_csv(out_path, index=False)
 
         valid = bbin_df.dropna(subset=["binary_pred"])
@@ -617,7 +621,9 @@ def update_breakdown_csv(
 
     # ── vetting scores ────────────────────────────────────────────────────────
     for (k, psf), vdf in sorted(vetting_results.items()):
-        out_path = os.path.join(results_dir, f"vetting_scores_k{k}_psf{psf}.csv")
+        out_subdir = os.path.join(results_dir, f"k{k}_psf{psf}")
+        os.makedirs(out_subdir, exist_ok=True)
+        out_path = os.path.join(out_subdir, f"vetting_scores_k{k}_psf{psf}.csv")
         vdf.to_csv(out_path, index=False)
 
         valid = vdf.dropna(subset=["vetting_score"])
@@ -647,7 +653,7 @@ def update_breakdown_csv(
 def load_test_kepids(results_dir: str) -> dict:
     """Read test kepids from scores_k*_psf*.csv files written by theModel.py."""
     import glob
-    pattern = os.path.join(results_dir, "scores_k*_psf*.csv")
+    pattern = os.path.join(results_dir, "k*_psf*", "scores_k*_psf*.csv")
     result = {}
     for f in sorted(glob.glob(pattern)):
         basename = os.path.basename(f)
@@ -663,7 +669,7 @@ def load_test_kepids(results_dir: str) -> dict:
 def load_cnn_scores(results_dir: str) -> dict:
     """Return dict[tag → DataFrame] with CNN scores for each (k, psf)."""
     import glob
-    pattern = os.path.join(results_dir, "scores_k*_psf*.csv")
+    pattern = os.path.join(results_dir, "k*_psf*", "scores_k*_psf*.csv")
     result = {}
     for f in sorted(glob.glob(pattern)):
         basename = os.path.basename(f)

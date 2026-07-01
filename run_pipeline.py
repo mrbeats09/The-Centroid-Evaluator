@@ -224,7 +224,8 @@ def main():
             [PYTHON, "theModel.py",
              "--results-dir", args.results_dir,
              ],
-            os.path.join(args.results_dir, f"scores_k{args.k_values[0]}_psf0.csv"),
+            os.path.join(args.results_dir, f"k{args.k_values[0]}_psf0",
+                         f"scores_k{args.k_values[0]}_psf0.csv"),
         ),
 
         # Step 6 — Bootstrap statistics + breakdown resolution
